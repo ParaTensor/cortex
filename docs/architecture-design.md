@@ -40,6 +40,12 @@ Cortex 专注于一件事：**以毫秒级吞吐实时摄取推理引擎的底�
 └─────────────────────────────────────────────────────────────┘
 ```
 
+### 1.3 设计状态与目标
+
+本文描述 Cortex 的目标架构，当前仓库处于设计验证阶段。文中的 `< 1ms` 选路延迟、`< 2ms` Tokenizer 开销和“数秒内完成账本同步”均为待基准测试验证的目标，而非已经达成的服务等级承诺。
+
+Cortex 不持久化 KV 账本，但它不是无运行时状态服务：每个实例都维护 Worker 生命周期、事件序号、同步状态和 Radix HashTree。生产部署必须显式处理账本重建与多副本账本差异，详见[账本同步与一致性](ledger-sync.md)和[高可用部署](ha-deployment.md)。
+
 ---
 
 ## 2. 核心架构与五大子系统
@@ -76,8 +82,10 @@ flowchart TD
   * **vLLM 协议栈**：订阅包含 `block_hashes`、`token_ids`、`extra_keys`（LoRA/多模态/Salt）的事件体。
   * 严格隔离两套账本，禁止跨引擎共用一棵树。
 * **数据一致性与生命周期管理**：
-  * **Seq 序号校验**：每个 Worker 产生的事件带有连续递增 `seq`，发生乱序丢弃、断线跳号时，标记该 Worker 账本失效并触发健康探针或清空该节点树分支，避免路由“死账”。
+  * **Seq 序号校验**：每个 Worker 产生的事件带有连续递增 `seq`。发现重复事件时幂等丢弃；发现跳号、乱序或连接中断时，立即把该 Worker 标记为 `STALE`，停止基于其账本进行 KV 亲和选路，并触发全量重同步。
   * **节点上下线生命周期**：Worker 探针心跳死亡时，先从 Live Pool 摘除，再原子级剪枝清理 HashTree 上的关联节点，杜绝迟到事件造成脏写。
+  * **同步门禁**：Worker 只有在健康检查通过且账本状态为 `READY` 时才能参与精确 KV 选路；`SYNCING` / `STALE` Worker 仅可按配置参与无 Cache 假设下的负载降级路由。
+  * 冷启动、事件缺口与重连的完整状态机见[账本同步与一致性](ledger-sync.md)。
 
 ### 2.2 精确 Radix 树与哈希引擎 (Radix HashTree & Hasher Engine)
 * **高性能 Radix HashTree 内存数据结构**：
@@ -86,6 +94,7 @@ flowchart TD
 * **网关侧 Tokenizer 对齐与 Cache**：
   * 内置针对各个模型的 Fast Tokenizer（通过本地 Tokenizer 库加载对应模型的 `tokenizer.json` 与 `chat_template.jinja`）。
   * 网关计算出请求的 Token IDs 后，按与 Worker 严格相同的分页算法（如 16 / 64 tokens per page）计算出前缀 Block Hash 序列，进 Radix 树执行 $O(\text{depth})$ 快速匹配。
+  * Tokenizer、Chat Template、`page_size`、哈希算法和模型扩展键必须作为同一个不可分割的版本化配置发布；任一字段无法确认一致时，禁止使用精确 KV 路由。详见[Tokenizer 与块哈希对齐规范](tokenizer-hash-alignment.md)。
 
 ### 2.3 负载与亲和力协同调度器 (Locality & Load Aware Scheduler)
 单纯选“命中 Cache 最多的 Worker”会导致请求倾倒（Cache Stampede / 热点过载）。调度器必须执行多维加权：
@@ -94,7 +103,8 @@ flowchart TD
 * **过载避让与动态熔断**：
   * 当最优 Cache 节点的当前并发或排队超过动态水位上限（High-Watermark），判定为“KV 收益已无法弥补排队延迟”，强制放弃部分 Cache 亲和，退化为在次优节点或空闲节点冷启动。
 * **优雅降级（Graceful Degradation）**：
-  * 若模型 Tokenizer 计算失败、Template 错配、或所有 Worker 均无命中，自动回退到 **P2C (Power of Two Choices)** 或 **加权最小连接数（Least Connections）** 算法。
+  * 调度优先级固定为：`exact_kv`（账本可信且存在命中）→ `load_aware`（账本可信但无命中）→ `p2c`（负载指标部分缺失）→ `round_robin`（仅存活信息可用）。
+  * 若 Tokenizer 计算失败、Template 错配、账本非 `READY` 或所有 Worker 均无命中，不得推测 Cache 命中，必须进入上述负载降级路径。
 
 ### 2.4 PD 分离编排器 (Prefill-Decode Disaggregation Orchestrator)
 当集群部署专用的 Prefill 实例池与 Decode 实例池时，Cortex 承担编排大脑：
@@ -104,6 +114,10 @@ flowchart TD
      * SGLang 体系：捕获响应头/报文中的 `bootstrap_info`（包含 Prefill 端建立的 RDMA/TCP 传输 Room 和端口）。
      * vLLM 体系：透传与挂载 `kv_transfer_params`。
   3. **Decode 阶段接力**：将握手元数据连同请求注入到挑选出的 Decode Worker，Decode 节点拉取 KV 张量后开始自回归生成，Cortex 将 SSE Token 流无缝透传回客户端。
+* **失败边界**：
+  * 在向客户端发送首个响应字节前，可按明确的幂等约束重选 Prefill / Decode Worker；开始流式响应后不得透明重放请求。
+  * Prefill 成功但 Decode 握手或 KV 传输失败时，默认回退到单节点冷启动执行；若请求或引擎不支持安全重放，则直接返回可观测的上游错误。
+  * 超时、重试和回退规则见[运行时与故障语义](runtime-failure-semantics.md)。
 
 ### 2.5 极速数据面与可观测性 (Data Plane & Metrics)
 * **Zero-Cost 异步流式管道**：
@@ -114,6 +128,9 @@ flowchart TD
     * `x-cortex-assigned-worker: sgl-worker-03`
     * `x-cortex-match-mode: exact_kv_events | fallback_p2c`
   * 方便 XRouter 记录请求日志与进行 Cache Break 断裂归因分析。
+* **最小生产可观测性**：
+  * Phase 1 即提供存活与就绪探针，并暴露路由延迟、哈希耗时、事件缺口、账本同步状态、降级原因和 Worker 负载指标。
+  * `ready` 只表示实例能够安全接收请求；账本尚未完成同步时允许以降级模式就绪，但必须通过指标和响应 Header 明确标识。
 
 ---
 
@@ -123,19 +140,26 @@ flowchart TD
 | :--- | :--- | :--- |
 | **内存/计算开销** | 网关侧跑 Fast Tokenizer 计算 Hash | 必须准确算出与引擎一致的页 Hash 才能命中树，通过 Rust 高性能分词将开销控制在 < 2ms |
 | **KV 张量管理** | **不存、不碰、不搬运任何 KV Tensor** | 网关只做控制流与元数据握手，张量搬运由引擎底层的 NIXL / RDMA / NCCL 完成 |
-| **持久化与状态** | **完全无状态（Stateless），内存即账本** | 节点掉线或重启后，重新订阅 ZMQ 即可在数秒内拉齐真账，无需外挂 MySQL/Redis |
-| **与 Dynamo 的关系** | **集成而非重写** | 当集群跑 Dynamo 时，Cortex 仅做透明代理或退让，不与其争抢 ZMQ 控制面 |
+| **持久化与状态** | **无外部持久化，运行时有状态** | 内存账本可丢弃并重建；重建期间关闭精确 KV 路由，不把未完成同步的状态当作真账 |
+| **多副本一致性** | **副本独立消费事件并独立维护账本** | 初始实现不引入分布式共识；通过上游负载均衡、同步门禁和降级路由保证安全，接受短暂命中率损失 |
+| **与 Dynamo 的关系** | **单一调度权威** | 同一流量路径上只允许一方执行 KV / PD 调度；Dynamo 已承担调度时，Cortex 仅作透明代理并关闭自身 KV / PD 决策 |
 
 ---
 
 ## 4. 实施演进路线 (Roadmap)
+
+### Phase 0：协议与基线冻结
+- [ ] 固化 Worker 注册、全量快照、增量事件及事件缺口恢复协议。
+- [ ] 建立 Tokenizer / Chat Template / Page Hash 的版本清单与 Golden Fixtures。
+- [ ] 明确单实例和多副本部署模式、Radix 树内存预算及故障降级语义。
 
 ### Phase 1：SGLang 单引擎真账对齐（MVP 验证）
 - [ ] 搭建 Rust 异步 HTTP 基础反代服务与动态 Worker 注册池。
 - [ ] 实现 SGLang ZMQ 事件订阅器（解码 `BlockStored`, `BlockRemoved`, `AllBlocksCleared`）。
 - [ ] 实现高性能内存 `RadixHashTree`（支持按 SHA256 Block 挂载 Worker 引用）。
 - [ ] 网关集成 Fast Tokenizer 与 SGLang 兼容的递归 SHA256 页哈希计算。
-- [ ] 实现基础 LCP（最长公共前缀）选路与无命中降级（Round-Robin / Least-Conn）。
+- [ ] 实现基础 LCP（最长公共前缀）选路与统一降级链（Load-Aware → P2C → Round-Robin）。
+- [ ] 提供 `/health/live`、`/health/ready` 和最小 Prometheus 指标集。
 - [ ] **验收**：双 Worker 共享 Prompt 压测，验证同类请求 100% 精准落到持有显存的那台；清空显存后命中精准消失。
 
 ### Phase 2：智能负载防击穿与 vLLM 引擎适配
@@ -148,5 +172,5 @@ flowchart TD
 - [ ] 实现 SGLang `bootstrap_info` 与 vLLM `kv_transfer_params` 的两阶段状态机与元数据透传管道。
 
 ### Phase 4：集群化生产打磨与 XRouter 上游对接
-- [ ] 完善 Prometheus 细粒度可观测性指标（真 Cache 命中率、Hash 耗时、选路延迟、Worker 负载偏置度）。
+- [ ] 完善 Prometheus 细粒度可观测性指标、告警规则和容量看板（真实 Cache 命中率、路由收益、Worker 负载偏置度）。
 - [ ] 标准化与 XRouter 的对接契约（专用 Cache Header 回传与动态集群发现）。

@@ -126,7 +126,7 @@ flowchart TD
   * 在响应 Header 中透传：
     * `x-cortex-cache-hit-tokens: 2048`
     * `x-cortex-assigned-worker: sgl-worker-03`
-    * `x-cortex-match-mode: exact_kv_events | fallback_p2c`
+    * `x-cortex-match-mode: exact_kv_events | load_aware | fallback_p2c | fallback_round_robin`
   * 方便 XRouter 记录请求日志与进行 Cache Break 断裂归因分析。
 * **最小生产可观测性**：
   * Phase 1 即提供存活与就绪探针，并暴露路由延迟、哈希耗时、事件缺口、账本同步状态、降级原因和 Worker 负载指标。

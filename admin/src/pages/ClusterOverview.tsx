@@ -1,56 +1,70 @@
-import React, { useState } from 'react'
+import React, { useState, useEffect } from 'react'
 import { Server, Activity, Zap, RefreshCw, Search, ShieldCheck } from 'lucide-react'
 import { useI18n } from '@/lib/i18n'
 import type { WorkerInfo } from '@/types'
 import { cn } from '@/lib/utils'
 
+interface ClusterApiResponse {
+  total_workers: number
+  ready_workers: number
+  total_active_requests: number
+  total_cached_blocks: number
+  workers: Array<{
+    id: string
+    model: string
+    engine: 'sglang' | 'vllm' | 'dynamo'
+    role: 'standard' | 'prefill' | 'decode'
+    status: 'init' | 'syncing' | 'ready' | 'stale'
+    http_endpoint: string
+    zmq_endpoint?: string
+    active_requests: number
+    last_seq: number
+    last_heartbeat_ms_ago: number
+  }>
+}
+
 export const ClusterOverview: React.FC = () => {
   const { t } = useI18n()
   const [searchTerm, setSearchTerm] = useState('')
   const [sortBy, setSortBy] = useState<'active' | 'blocks'>('active')
+  const [workers, setWorkers] = useState<WorkerInfo[]>([])
+  const [totalCachedBlocks, setTotalCachedBlocks] = useState(0)
+  const [loading, setLoading] = useState(true)
 
-  // Initial mock state from config
-  const [workers] = useState<WorkerInfo[]>([
-    {
-      id: 'sgl-worker-01',
-      model: 'meta-llama/Llama-3.1-8B-Instruct',
-      engine: 'sglang',
-      role: 'standard',
-      status: 'ready',
-      httpEndpoint: 'http://127.0.0.1:8001',
-      zmqEndpoint: 'tcp://127.0.0.1:5557',
-      activeRequests: 4,
-      cachedBlocks: 1420,
-      lastSeq: 892,
-      lastHeartbeatMs: 240,
-    },
-    {
-      id: 'sgl-worker-02',
-      model: 'meta-llama/Llama-3.1-8B-Instruct',
-      engine: 'sglang',
-      role: 'standard',
-      status: 'ready',
-      httpEndpoint: 'http://127.0.0.1:8002',
-      zmqEndpoint: 'tcp://127.0.0.1:5558',
-      activeRequests: 2,
-      cachedBlocks: 980,
-      lastSeq: 430,
-      lastHeartbeatMs: 180,
-    },
-    {
-      id: 'vllm-worker-01',
-      model: 'Qwen/Qwen2.5-72B-Instruct',
-      engine: 'vllm',
-      role: 'prefill',
-      status: 'syncing',
-      httpEndpoint: 'http://127.0.0.1:8003',
-      zmqEndpoint: 'tcp://127.0.0.1:5559',
-      activeRequests: 0,
-      cachedBlocks: 0,
-      lastSeq: 0,
-      lastHeartbeatMs: 620,
-    },
-  ])
+  const fetchClusterStatus = async () => {
+    try {
+      const res = await fetch('/api/v1/cluster/status')
+      if (res.ok) {
+        const data: ClusterApiResponse = await res.json()
+        setTotalCachedBlocks(data.total_cached_blocks || 0)
+        setWorkers(
+          data.workers.map((w) => ({
+            id: w.id,
+            model: w.model,
+            engine: w.engine,
+            role: w.role,
+            status: w.status,
+            httpEndpoint: w.http_endpoint,
+            zmqEndpoint: w.zmq_endpoint,
+            activeRequests: w.active_requests,
+            cachedBlocks: 0,
+            lastSeq: w.last_seq,
+            lastHeartbeatMs: w.last_heartbeat_ms_ago,
+          }))
+        )
+      }
+    } catch {
+      // Fallback for isolated offline testing
+    } finally {
+      setLoading(false)
+    }
+  };
+
+  useEffect(() => {
+    fetchClusterStatus()
+    const timer = setInterval(fetchClusterStatus, 3000)
+    return () => clearInterval(timer)
+  }, [])
 
   const filteredWorkers = workers
     .filter(
@@ -88,10 +102,10 @@ export const ClusterOverview: React.FC = () => {
           </p>
         </div>
         <button
-          onClick={() => window.location.reload()}
+          onClick={fetchClusterStatus}
           className="inline-flex items-center gap-1.5 px-3 py-1.5 text-xs font-medium bg-primary text-primary-foreground rounded-md hover:bg-primary/90 transition-colors shadow-xs cursor-pointer"
         >
-          <RefreshCw className="w-3.5 h-3.5" />
+          <RefreshCw className={cn("w-3.5 h-3.5", loading && "animate-spin")} />
           {t.common.refresh}
         </button>
       </div>
@@ -122,12 +136,12 @@ export const ClusterOverview: React.FC = () => {
 
         <div className="bg-card border border-border rounded-lg p-4 shadow-2xs">
           <div className="flex items-center justify-between text-muted-foreground">
-            <span className="text-xs font-medium">{t.common.hitRate}</span>
+            <span className="text-xs font-medium">{t.common.cachedBlocks}</span>
             <Zap className="w-4 h-4 text-warning" />
           </div>
           <div className="mt-2 flex items-baseline gap-2">
-            <span className="text-2xl font-bold tracking-tight text-success">88.4%</span>
-            <span className="text-xs text-muted-foreground">+35% vs 猜测</span>
+            <span className="text-2xl font-bold tracking-tight text-foreground">{totalCachedBlocks}</span>
+            <span className="text-xs text-muted-foreground">Radix 节点</span>
           </div>
         </div>
 
@@ -139,15 +153,15 @@ export const ClusterOverview: React.FC = () => {
           <div className="mt-2 text-xs space-y-1">
             <div className="flex justify-between">
               <span className="text-muted-foreground">{t.metrics.exactKv}</span>
-              <span className="font-semibold">82%</span>
+              <span className="font-semibold">{readyCount > 0 ? 'Active' : 'Offline'}</span>
             </div>
             <div className="flex justify-between">
               <span className="text-muted-foreground">{t.metrics.loadAware}</span>
-              <span className="font-semibold">15%</span>
+              <span className="font-semibold">Enabled</span>
             </div>
             <div className="flex justify-between">
               <span className="text-muted-foreground">{t.metrics.fallback}</span>
-              <span className="font-semibold">3%</span>
+              <span className="font-semibold">P2C Active</span>
             </div>
           </div>
         </div>
@@ -192,34 +206,42 @@ export const ClusterOverview: React.FC = () => {
                 <th className="px-4 py-3">{t.common.role}</th>
                 <th className="px-4 py-3">{t.common.model}</th>
                 <th className="px-4 py-3">{t.common.activeRequests}</th>
-                <th className="px-4 py-3">{t.common.cachedBlocks}</th>
+                <th className="px-4 py-3">Last Seq</th>
                 <th className="px-4 py-3">HTTP / ZMQ Endpoint</th>
               </tr>
             </thead>
             <tbody className="divide-y divide-border">
-              {filteredWorkers.map((worker) => (
-                <tr key={worker.id} className="hover:bg-muted/30 transition-colors">
-                  <td className="px-4 py-3 font-semibold text-foreground">{worker.id}</td>
-                  <td className="px-4 py-3">{getStatusBadge(worker.status)}</td>
-                  <td className="px-4 py-3">
-                    <span className="px-2 py-0.5 rounded text-[11px] font-mono uppercase bg-primary/10 text-primary font-medium">
-                      {worker.engine}
-                    </span>
-                  </td>
-                  <td className="px-4 py-3 text-muted-foreground capitalize">{worker.role}</td>
-                  <td className="px-4 py-3 font-mono text-[11px] text-foreground">{worker.model}</td>
-                  <td className="px-4 py-3">
-                    <span className={cn('font-semibold', worker.activeRequests > 5 ? 'text-warning' : 'text-foreground')}>
-                      {worker.activeRequests}
-                    </span>
-                  </td>
-                  <td className="px-4 py-3 font-mono font-medium text-foreground">{worker.cachedBlocks}</td>
-                  <td className="px-4 py-3 font-mono text-[11px] text-muted-foreground">
-                    <div>{worker.httpEndpoint}</div>
-                    {worker.zmqEndpoint && <div className="text-[10px] text-muted-foreground/80">{worker.zmqEndpoint}</div>}
+              {filteredWorkers.length === 0 ? (
+                <tr>
+                  <td colSpan={8} className="px-4 py-6 text-center text-muted-foreground">
+                    {loading ? '加载中...' : '暂无 Worker 连接'}
                   </td>
                 </tr>
-              ))}
+              ) : (
+                filteredWorkers.map((worker) => (
+                  <tr key={worker.id} className="hover:bg-muted/30 transition-colors">
+                    <td className="px-4 py-3 font-semibold text-foreground">{worker.id}</td>
+                    <td className="px-4 py-3">{getStatusBadge(worker.status)}</td>
+                    <td className="px-4 py-3">
+                      <span className="px-2 py-0.5 rounded text-[11px] font-mono uppercase bg-primary/10 text-primary font-medium">
+                        {worker.engine}
+                      </span>
+                    </td>
+                    <td className="px-4 py-3 text-muted-foreground capitalize">{worker.role}</td>
+                    <td className="px-4 py-3 font-mono text-[11px] text-foreground">{worker.model}</td>
+                    <td className="px-4 py-3">
+                      <span className={cn('font-semibold', worker.activeRequests > 5 ? 'text-warning' : 'text-foreground')}>
+                        {worker.activeRequests}
+                      </span>
+                    </td>
+                    <td className="px-4 py-3 font-mono font-medium text-foreground">{worker.lastSeq}</td>
+                    <td className="px-4 py-3 font-mono text-[11px] text-muted-foreground">
+                      <div>{worker.httpEndpoint}</div>
+                      {worker.zmqEndpoint && <div className="text-[10px] text-muted-foreground/80">{worker.zmqEndpoint}</div>}
+                    </td>
+                  </tr>
+                ))
+              )}
             </tbody>
           </table>
         </div>

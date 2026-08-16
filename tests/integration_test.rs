@@ -18,6 +18,7 @@ async fn test_end_to_end_zmq_event_to_exact_kv_routing() {
         engine: EngineType::Sglang,
         http_endpoint: "http://127.0.0.1:8001".to_string(),
         zmq_endpoint: Some("tcp://127.0.0.1:5557".to_string()),
+        tokenizer_path: None,
         role: WorkerRole::Standard,
         page_size: 16,
         weight: 100,
@@ -28,6 +29,7 @@ async fn test_end_to_end_zmq_event_to_exact_kv_routing() {
         engine: EngineType::Sglang,
         http_endpoint: "http://127.0.0.1:8002".to_string(),
         zmq_endpoint: Some("tcp://127.0.0.1:5558".to_string()),
+        tokenizer_path: None,
         role: WorkerRole::Standard,
         page_size: 16,
         weight: 100,
@@ -47,11 +49,11 @@ async fn test_end_to_end_zmq_event_to_exact_kv_routing() {
     let page_hashes = compute_sglang_page_hashes(&tokens, 16);
     assert_eq!(page_hashes.len(), 4);
 
-    // Initial query should fallback to load-aware / round-robin because workers are not READY
+    // Initial query should fallback to P2C / load-aware because workers are not READY
     let init_decision = scheduler
         .select_worker("meta-llama/Llama-3.1-8B-Instruct", &page_hashes, None)
         .unwrap();
-    assert_eq!(init_decision.mode, RoutingMode::LoadAware);
+    assert_eq!(init_decision.mode, RoutingMode::FallbackP2c);
     assert_eq!(init_decision.matched_pages, 0);
 
     // 2. Simulate Worker 1 broadcasting BlockStored events over ZMQ
@@ -88,5 +90,5 @@ async fn test_end_to_end_zmq_event_to_exact_kv_routing() {
         .select_worker("meta-llama/Llama-3.1-8B-Instruct", &page_hashes, None)
         .unwrap();
     assert_eq!(after_evict_decision.matched_pages, 0);
-    assert_eq!(after_evict_decision.mode, RoutingMode::LoadAware);
+    assert_eq!(after_evict_decision.mode, RoutingMode::FallbackP2c);
 }

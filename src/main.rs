@@ -8,12 +8,15 @@ use clap::Parser;
 use dashmap::DashMap;
 use tower_http::cors::CorsLayer;
 use tower_http::trace::TraceLayer;
-use tracing::info;
+use tracing::{info, warn};
 
 use cortex::config::CortexConfig;
+use cortex::hasher::{TokenizerEngine, TokenizerRegistry};
 use cortex::ledger::{RadixHashTree, WorkerRuntimeState};
 use cortex::metrics::{health_live, health_ready};
-use cortex::proxy::{chat_completions_handler, list_models_handler, AppState};
+use cortex::proxy::{
+    chat_completions_handler, cluster_status_handler, list_models_handler, AppState,
+};
 use cortex::scheduler::LocalityScheduler;
 
 #[derive(Parser, Debug)]
@@ -75,7 +78,39 @@ async fn main() -> anyhow::Result<()> {
         workers.clone(),
     ));
 
-    let tokenizer_registry = Arc::new(cortex::hasher::TokenizerRegistry::new(10000));
+    // Initialize Tokenizer Registry and register configured models
+    let tokenizer_registry = Arc::new(TokenizerRegistry::new(10000));
+
+    for model_cfg in &config.models {
+        if let Some(tok_path) = &model_cfg.tokenizer_path {
+            match TokenizerEngine::from_file(tok_path, model_cfg.chat_template.clone()) {
+                Ok(engine) => {
+                    info!(model_id = %model_cfg.model_id, path = %tok_path, "Successfully loaded and registered tokenizer");
+                    tokenizer_registry.register(&model_cfg.model_id, engine);
+                }
+                Err(e) => {
+                    warn!(model_id = %model_cfg.model_id, path = %tok_path, error = %e, "Failed to load tokenizer; will fallback to load-aware routing");
+                }
+            }
+        }
+    }
+
+    // Also check worker configs for per-worker tokenizer paths
+    for w_cfg in &config.workers {
+        if let Some(tok_path) = &w_cfg.tokenizer_path {
+            if !tokenizer_registry.contains_model(&w_cfg.model) {
+                match TokenizerEngine::from_file(tok_path, None) {
+                    Ok(engine) => {
+                        info!(model_id = %w_cfg.model, path = %tok_path, "Successfully loaded worker tokenizer");
+                        tokenizer_registry.register(&w_cfg.model, engine);
+                    }
+                    Err(e) => {
+                        warn!(model_id = %w_cfg.model, path = %tok_path, error = %e, "Failed to load worker tokenizer");
+                    }
+                }
+            }
+        }
+    }
 
     let app_state = AppState {
         config: Arc::new(config.clone()),
@@ -90,6 +125,8 @@ async fn main() -> anyhow::Result<()> {
         // Health & Diagnostics
         .route("/health/live", get(health_live))
         .route("/health/ready", get(health_ready))
+        // Cluster Admin & Diagnostics API
+        .route("/api/v1/cluster/status", get(cluster_status_handler))
         // OpenAI-compatible endpoints
         .route("/v1/models", get(list_models_handler))
         .route("/v1/chat/completions", post(chat_completions_handler))

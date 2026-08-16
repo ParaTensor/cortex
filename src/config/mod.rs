@@ -7,6 +7,8 @@ pub struct CortexConfig {
     #[serde(default = "default_port")]
     pub port: u16,
     #[serde(default)]
+    pub models: Vec<ModelConfig>,
+    #[serde(default)]
     pub workers: Vec<WorkerConfig>,
     #[serde(default)]
     pub scheduler: SchedulerConfig,
@@ -18,6 +20,13 @@ fn default_host() -> String {
 
 fn default_port() -> u16 {
     8000
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ModelConfig {
+    pub model_id: String,
+    pub tokenizer_path: Option<String>,
+    pub chat_template: Option<String>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -49,6 +58,7 @@ pub struct WorkerConfig {
     pub engine: EngineType,
     pub http_endpoint: String,
     pub zmq_endpoint: Option<String>,
+    pub tokenizer_path: Option<String>,
     #[serde(default)]
     pub role: WorkerRole,
     #[serde(default = "default_page_size")]
@@ -73,6 +83,9 @@ pub struct SchedulerConfig {
     pub load_weight: f64,
     #[serde(default = "default_high_watermark")]
     pub max_active_requests_per_worker: usize,
+    /// Threshold difference of active requests to trigger P2C or load-aware fallback
+    #[serde(default = "default_enable_p2c")]
+    pub enable_p2c: bool,
 }
 
 fn default_kv_weight() -> f64 {
@@ -87,12 +100,17 @@ fn default_high_watermark() -> usize {
     64
 }
 
+fn default_enable_p2c() -> bool {
+    true
+}
+
 impl Default for SchedulerConfig {
     fn default() -> Self {
         Self {
             kv_weight: default_kv_weight(),
             load_weight: default_load_weight(),
             max_active_requests_per_worker: default_high_watermark(),
+            enable_p2c: default_enable_p2c(),
         }
     }
 }
@@ -102,6 +120,7 @@ impl Default for CortexConfig {
         Self {
             host: default_host(),
             port: default_port(),
+            models: vec![],
             workers: vec![],
             scheduler: SchedulerConfig::default(),
         }

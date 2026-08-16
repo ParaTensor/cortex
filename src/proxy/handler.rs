@@ -1,4 +1,5 @@
 use std::sync::Arc;
+use std::time::Instant;
 use axum::{
     body::Body,
     extract::State,
@@ -35,7 +36,6 @@ pub async fn chat_completions_handler(
         .and_then(|v| v.as_str())
         .unwrap_or("default");
 
-    // Extract page size (default 16)
     let page_size = 16;
 
     // 1. Tokenize messages or prompt with Fast Tokenizer & LRU Cache
@@ -170,5 +170,55 @@ pub async fn list_models_handler(State(state): State<AppState>) -> impl IntoResp
     Json(serde_json::json!({
         "object": "list",
         "data": data
+    }))
+}
+
+pub async fn cluster_status_handler(State(state): State<AppState>) -> impl IntoResponse {
+    let mut total_active = 0;
+    let mut ready_count = 0;
+    let mut worker_list = Vec::new();
+    let now = Instant::now();
+
+    for entry in state.workers.iter() {
+        let w = entry.value();
+        let status = *w.status.read();
+        let active = w.get_active_requests();
+        total_active += active;
+
+        let status_str = match status {
+            crate::ledger::WorkerSyncStatus::Init => "init",
+            crate::ledger::WorkerSyncStatus::Syncing => "syncing",
+            crate::ledger::WorkerSyncStatus::Ready => {
+                ready_count += 1;
+                "ready"
+            }
+            crate::ledger::WorkerSyncStatus::Stale => "stale",
+        };
+
+        let last_hb = *w.last_heartbeat.read();
+        let hb_ago_ms = now.saturating_duration_since(last_hb).as_millis() as u64;
+
+        worker_list.push(serde_json::json!({
+            "id": w.config.id,
+            "model": w.config.model,
+            "engine": serde_json::to_value(w.config.engine).unwrap_or(Value::String("sglang".to_string())),
+            "role": serde_json::to_value(w.config.role).unwrap_or(Value::String("standard".to_string())),
+            "status": status_str,
+            "http_endpoint": w.config.http_endpoint,
+            "zmq_endpoint": w.config.zmq_endpoint,
+            "active_requests": active,
+            "last_seq": *w.last_seq.read(),
+            "last_heartbeat_ms_ago": hb_ago_ms,
+        }));
+    }
+
+    let total_blocks = state.tree.total_cached_blocks();
+
+    Json(serde_json::json!({
+        "total_workers": state.workers.len(),
+        "ready_workers": ready_count,
+        "total_active_requests": total_active,
+        "total_cached_blocks": total_blocks,
+        "workers": worker_list,
     }))
 }

@@ -9,6 +9,20 @@ struct TreeNode {
     workers: HashSet<String>,
 }
 
+impl TreeNode {
+    fn is_empty(&self) -> bool {
+        self.workers.is_empty() && self.children.is_empty()
+    }
+
+    fn count_nodes(&self) -> usize {
+        let mut count = if !self.workers.is_empty() { 1 } else { 0 };
+        for child in self.children.values() {
+            count += child.count_nodes();
+        }
+        count
+    }
+}
+
 #[derive(Debug, Default)]
 pub struct RadixHashTree {
     root: RwLock<TreeNode>,
@@ -34,6 +48,36 @@ impl RadixHashTree {
             next.workers.insert(worker_id.to_string());
             current = next;
         }
+    }
+
+    /// Removes specific block hashes for a given worker (e.g. upon LRU eviction)
+    pub fn remove_chain(&self, worker_id: &str, page_hashes: &[i64]) {
+        if page_hashes.is_empty() {
+            return;
+        }
+
+        let mut root = self.root.write();
+
+        fn prune_path(node: &mut TreeNode, worker_id: &str, hashes: &[i64]) {
+            if hashes.is_empty() {
+                return;
+            }
+
+            let first = hashes[0];
+            if let Some(child) = node.children.get_mut(&first) {
+                if hashes.len() == 1 {
+                    child.workers.remove(worker_id);
+                } else {
+                    prune_path(child, worker_id, &hashes[1..]);
+                }
+
+                if child.is_empty() {
+                    node.children.remove(&first);
+                }
+            }
+        }
+
+        prune_path(&mut root, worker_id, page_hashes);
     }
 
     /// Clears all blocks associated with a given worker
@@ -78,6 +122,12 @@ impl RadixHashTree {
 
         results
     }
+
+    /// Returns the total number of cached prefix nodes in the tree across all workers.
+    pub fn total_cached_blocks(&self) -> usize {
+        let root = self.root.read();
+        root.count_nodes()
+    }
 }
 
 #[cfg(test)]
@@ -85,7 +135,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn test_radix_tree_insert_and_match() {
+    fn test_radix_tree_insert_remove_and_match() {
         let tree = RadixHashTree::new();
         let hashes = vec![1001, 1002, 1003, 1004];
 
@@ -99,11 +149,16 @@ mod tests {
         let matches = tree.find_lcp_matches(&hashes, &eligible);
         assert_eq!(matches.get("worker-1"), Some(&3));
         assert_eq!(matches.get("worker-2"), Some(&4));
+        assert_eq!(tree.total_cached_blocks(), 4);
 
-        // Test clear
-        tree.clear_worker("worker-2");
-        let matches_after = tree.find_lcp_matches(&hashes, &eligible);
-        assert_eq!(matches_after.get("worker-1"), Some(&3));
-        assert_eq!(matches_after.get("worker-2"), None);
+        // Test remove_chain on worker-2 for block 4
+        tree.remove_chain("worker-2", &hashes[0..4]);
+        let matches_after_remove = tree.find_lcp_matches(&hashes, &eligible);
+        assert_eq!(matches_after_remove.get("worker-2"), Some(&3)); // still has 1..3
+
+        // Test clear worker 1
+        tree.clear_worker("worker-1");
+        let matches_after_clear = tree.find_lcp_matches(&hashes, &eligible);
+        assert_eq!(matches_after_clear.get("worker-1"), None);
     }
 }

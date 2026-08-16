@@ -5,6 +5,12 @@ scheduler:
   kv_weight: 1.0
   load_weight: 0.5
   max_active_requests_per_worker: 64
+  enable_p2c: true
+
+models:
+  - model_id: "meta-llama/Llama-3.1-8B-Instruct"
+    tokenizer_path: null
+    chat_template: null
 
 workers:
   - id: "sgl-worker-01"

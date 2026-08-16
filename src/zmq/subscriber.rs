@@ -11,18 +11,22 @@ use crate::ledger::{RadixHashTree, WorkerRuntimeState, WorkerSyncStatus};
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum KvEventPayload {
+    #[serde(alias = "store", alias = "BlockStored")]
     BlockStored {
         page_hashes: Vec<i64>,
     },
+    #[serde(alias = "remove", alias = "BlockRemoved")]
     BlockRemoved {
         page_hashes: Vec<i64>,
     },
+    #[serde(alias = "clear", alias = "AllBlocksCleared")]
     AllBlocksCleared,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct KvEventMessage {
     pub seq: u64,
+    #[serde(flatten)]
     pub payload: KvEventPayload,
 }
 
@@ -35,20 +39,35 @@ impl KvEventProcessor {
         Self { tree }
     }
 
-    /// Processes an incoming KV event for a worker, validating strict sequence monotonicity.
+    /// Parses raw frame bytes, supporting both MessagePack (SGLang native) and JSON.
+    pub fn parse_frame(bytes: &[u8]) -> Option<KvEventMessage> {
+        // Try MessagePack first (standard SGLang SRT format)
+        if let Ok(event) = rmp_serde::from_slice::<KvEventMessage>(bytes) {
+            return Some(event);
+        }
+        // Fallback to JSON
+        if let Ok(event) = serde_json::from_slice::<KvEventMessage>(bytes) {
+            return Some(event);
+        }
+        None
+    }
+
+    /// Processes an incoming KV event for a worker, validating strict sequence monotonicity
+    /// and enforcing the ledger synchronization gatekeeper.
     pub fn process_event(&self, worker: &WorkerRuntimeState, event: KvEventMessage) {
         let mut last_seq_guard = worker.last_seq.write();
+        let current_status = *worker.status.read();
         let expected_seq = *last_seq_guard + 1;
 
+        // 1. Seq Monotonicity Check
         if *last_seq_guard > 0 && event.seq != expected_seq {
             warn!(
                 worker_id = %worker.config.id,
                 expected_seq = expected_seq,
                 actual_seq = event.seq,
-                "ZMQ event sequence gap detected. Marking worker as STALE."
+                "ZMQ event sequence gap detected. Marking worker as STALE and pruning dirty ledger."
             );
             worker.set_status(WorkerSyncStatus::Stale);
-            // Clear dirty radix ledger entries for this stale worker
             self.tree.clear_worker(&worker.config.id);
             *last_seq_guard = event.seq;
             return;
@@ -57,19 +76,37 @@ impl KvEventProcessor {
         *last_seq_guard = event.seq;
         worker.update_heartbeat();
 
+        // 2. Ledger Sync Gatekeeper
         match event.payload {
             KvEventPayload::BlockStored { page_hashes } => {
+                if current_status == WorkerSyncStatus::Stale {
+                    // Critical Gatekeeper: STALE workers cannot accept incremental block insertions
+                    // until baseline is fully reset via AllBlocksCleared or snapshot sync.
+                    warn!(
+                        worker_id = %worker.config.id,
+                        seq = event.seq,
+                        "Worker is STALE. Ignoring incremental BlockStored event to prevent ledger pollution."
+                    );
+                    return;
+                }
+
                 self.tree.insert_chain(&worker.config.id, &page_hashes);
-                if *worker.status.read() == WorkerSyncStatus::Syncing || *worker.status.read() == WorkerSyncStatus::Init {
+                if current_status == WorkerSyncStatus::Syncing || current_status == WorkerSyncStatus::Init {
+                    info!(worker_id = %worker.config.id, "Worker synchronized. Transitioning to READY.");
                     worker.set_status(WorkerSyncStatus::Ready);
                 }
             }
-            KvEventPayload::BlockRemoved { .. } => {
-                // Individual block removal
+            KvEventPayload::BlockRemoved { page_hashes } => {
+                if current_status == WorkerSyncStatus::Stale {
+                    return;
+                }
+                self.tree.remove_chain(&worker.config.id, &page_hashes);
             }
             KvEventPayload::AllBlocksCleared => {
-                info!(worker_id = %worker.config.id, "All blocks cleared on worker. Resetting ledger branch.");
+                info!(worker_id = %worker.config.id, "All blocks cleared on worker. Baseline reset; transitioning to READY.");
                 self.tree.clear_worker(&worker.config.id);
+                // Baseline cleanly reset -> worker is now clean and Ready
+                worker.set_status(WorkerSyncStatus::Ready);
             }
         }
     }
@@ -101,15 +138,14 @@ pub fn spawn_worker_zmq_subscriber(
                         continue;
                     }
 
-                    // Set status to Syncing upon connection
                     if *worker.status.read() == WorkerSyncStatus::Init {
                         worker.set_status(WorkerSyncStatus::Syncing);
                     }
 
                     while let Ok(msg) = socket.recv().await {
-                        // SGLang multipart message format: [topic, seq/payload] or single JSON frame
+                        // SGLang multipart message format: [topic, payload] or single payload frame
                         for part in msg.iter() {
-                            if let Ok(event) = serde_json::from_slice::<KvEventMessage>(part) {
+                            if let Some(event) = KvEventProcessor::parse_frame(part) {
                                 processor.process_event(&worker, event);
                             }
                         }
@@ -147,7 +183,27 @@ mod tests {
     use crate::config::{EngineType, WorkerConfig, WorkerRole};
 
     #[test]
-    fn test_kv_event_processor_seq_gap() {
+    fn test_kv_event_processor_msgpack_and_json_parsing() {
+        let event = KvEventMessage {
+            seq: 42,
+            payload: KvEventPayload::BlockStored {
+                page_hashes: vec![101, 102, 103],
+            },
+        };
+
+        // Test JSON parsing
+        let json_bytes = serde_json::to_vec(&event).unwrap();
+        let parsed_json = KvEventProcessor::parse_frame(&json_bytes).unwrap();
+        assert_eq!(parsed_json.seq, 42);
+
+        // Test MessagePack parsing
+        let msgpack_bytes = rmp_serde::to_vec(&event).unwrap();
+        let parsed_msgpack = KvEventProcessor::parse_frame(&msgpack_bytes).unwrap();
+        assert_eq!(parsed_msgpack.seq, 42);
+    }
+
+    #[test]
+    fn test_kv_event_processor_stale_gatekeeper() {
         let tree = Arc::new(RadixHashTree::new());
         let processor = KvEventProcessor::new(tree.clone());
 
@@ -157,13 +213,14 @@ mod tests {
             engine: EngineType::Sglang,
             http_endpoint: "http://127.0.0.1:8000".to_string(),
             zmq_endpoint: None,
+            tokenizer_path: None,
             role: WorkerRole::Standard,
             page_size: 16,
             weight: 100,
         };
         let worker = WorkerRuntimeState::new(cfg);
 
-        // First event (seq 1)
+        // Event 1: Normal initialization
         processor.process_event(
             &worker,
             KvEventMessage {
@@ -174,8 +231,9 @@ mod tests {
             },
         );
         assert_eq!(*worker.status.read(), WorkerSyncStatus::Ready);
+        assert_eq!(tree.total_cached_blocks(), 1);
 
-        // Gap event (seq 5 instead of 2) -> should mark STALE
+        // Event 2: Gap detected (seq 5 instead of 2) -> Worker becomes STALE and tree is cleared
         processor.process_event(
             &worker,
             KvEventMessage {
@@ -186,5 +244,29 @@ mod tests {
             },
         );
         assert_eq!(*worker.status.read(), WorkerSyncStatus::Stale);
+        assert_eq!(tree.total_cached_blocks(), 0);
+
+        // Event 3: Incremental BlockStored while STALE must NOT re-enter Ready and must NOT pollute tree
+        processor.process_event(
+            &worker,
+            KvEventMessage {
+                seq: 6,
+                payload: KvEventPayload::BlockStored {
+                    page_hashes: vec![99999],
+                },
+            },
+        );
+        assert_eq!(*worker.status.read(), WorkerSyncStatus::Stale);
+        assert_eq!(tree.total_cached_blocks(), 0);
+
+        // Event 4: AllBlocksCleared cleanly resets baseline -> Worker transitions back to Ready
+        processor.process_event(
+            &worker,
+            KvEventMessage {
+                seq: 7,
+                payload: KvEventPayload::AllBlocksCleared,
+            },
+        );
+        assert_eq!(*worker.status.read(), WorkerSyncStatus::Ready);
     }
 }

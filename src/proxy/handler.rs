@@ -11,7 +11,7 @@ use serde_json::Value;
 use tracing::{error, warn};
 
 use crate::config::CortexConfig;
-use crate::hasher::compute_sglang_page_hashes;
+use crate::hasher::{compute_sglang_page_hashes, ChatMessage, TokenizerRegistry};
 use crate::ledger::{RadixHashTree, WorkerRuntimeState};
 use crate::scheduler::LocalityScheduler;
 
@@ -21,6 +21,7 @@ pub struct AppState {
     pub scheduler: Arc<LocalityScheduler>,
     pub tree: Arc<RadixHashTree>,
     pub workers: Arc<dashmap::DashMap<String, Arc<WorkerRuntimeState>>>,
+    pub tokenizer_registry: Arc<TokenizerRegistry>,
     pub http_client: reqwest::Client,
 }
 
@@ -34,15 +35,33 @@ pub async fn chat_completions_handler(
         .and_then(|v| v.as_str())
         .unwrap_or("default");
 
-    // In MVP phase: extract token IDs if provided in header or compute mock hashes from prompt
-    // In full tokenizer phase: tokenization is invoked on prompt
+    // Extract page size (default 16)
+    let page_size = 16;
+
+    // 1. Tokenize messages or prompt with Fast Tokenizer & LRU Cache
     let mut page_hashes = Vec::new();
-    if let Some(prompt) = payload.get("prompt").and_then(|p| p.as_str()) {
-        // Simple mock tokenization for initial MVP test (4 chars per token)
-        let token_ids: Vec<u32> = prompt.as_bytes().iter().map(|&b| b as u32).collect();
-        page_hashes = compute_sglang_page_hashes(&token_ids, 16);
+
+    if let Some(messages_val) = payload.get("messages").and_then(|m| m.as_array()) {
+        let mut chat_messages = Vec::with_capacity(messages_val.len());
+        for msg in messages_val {
+            let role = msg.get("role").and_then(|r| r.as_str()).unwrap_or("user");
+            let content = msg.get("content").and_then(|c| c.as_str()).unwrap_or("");
+            chat_messages.push(ChatMessage {
+                role: role.to_string(),
+                content: content.to_string(),
+            });
+        }
+
+        if let Some(token_ids) = state.tokenizer_registry.tokenize_chat(model, &chat_messages) {
+            page_hashes = compute_sglang_page_hashes(&token_ids, page_size);
+        }
+    } else if let Some(prompt) = payload.get("prompt").and_then(|p| p.as_str()) {
+        if let Some(token_ids) = state.tokenizer_registry.tokenize_text(model, prompt) {
+            page_hashes = compute_sglang_page_hashes(&token_ids, page_size);
+        }
     }
 
+    // 2. Schedule request using 4-tier fallback
     let decision = match state.scheduler.select_worker(model, &page_hashes, None) {
         Some(d) => d,
         None => {
@@ -99,7 +118,7 @@ pub async fn chat_completions_handler(
     );
     response_headers.insert(
         "x-cortex-cache-hit-tokens",
-        HeaderValue::from_str(&(decision.matched_pages * 16).to_string())
+        HeaderValue::from_str(&(decision.matched_pages * page_size).to_string())
             .unwrap_or(HeaderValue::from_static("0")),
     );
 
@@ -109,7 +128,6 @@ pub async fn chat_completions_handler(
         item.map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))
     });
 
-    // Wrap stream to ensure decrementing active requests when stream ends or drops
     let stream_with_cleanup = async_stream::stream! {
         let _guard = scopeguard::guard(worker_guard, |w| {
             w.dec_active_requests();

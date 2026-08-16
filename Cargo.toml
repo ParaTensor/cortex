@@ -35,6 +35,11 @@ arc-swap = "1.7"
 # ZMQ Protocol
 zeromq = "0.4"
 
+# Tokenization & Chat Template
+tokenizers = { version = "0.21", default-features = false, features = ["onig"] }
+minijinja = { version = "2.7", features = ["json"] }
+lru = "0.13"
+
 # Cryptography & Hash
 sha2 = "0.10"
 hex = "0.4"

@@ -72,11 +72,14 @@ async fn main() -> anyhow::Result<()> {
         workers.clone(),
     ));
 
+    let tokenizer_registry = Arc::new(cortex::hasher::TokenizerRegistry::new(10000));
+
     let app_state = AppState {
         config: Arc::new(config.clone()),
         scheduler,
         tree,
         workers,
+        tokenizer_registry,
         http_client: reqwest::Client::builder().build()?,
     };
 

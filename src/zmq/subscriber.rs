@@ -1,6 +1,11 @@
 use std::sync::Arc;
+use std::time::Duration;
+use dashmap::DashMap;
 use serde::{Deserialize, Serialize};
-use tracing::{info, warn};
+use tokio::time::sleep;
+use tracing::{error, info, warn};
+use zeromq::{Socket, SocketRecv, SubSocket};
+
 use crate::ledger::{RadixHashTree, WorkerRuntimeState, WorkerSyncStatus};
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -66,6 +71,72 @@ impl KvEventProcessor {
                 info!(worker_id = %worker.config.id, "All blocks cleared on worker. Resetting ledger branch.");
                 self.tree.clear_worker(&worker.config.id);
             }
+        }
+    }
+}
+
+/// Spawns a dedicated background Tokio task to subscribe to a Worker's ZMQ event stream.
+pub fn spawn_worker_zmq_subscriber(
+    worker: Arc<WorkerRuntimeState>,
+    processor: Arc<KvEventProcessor>,
+) {
+    let endpoint = match &worker.config.zmq_endpoint {
+        Some(ep) if !ep.is_empty() => ep.clone(),
+        _ => return,
+    };
+
+    let worker_id = worker.config.id.clone();
+
+    tokio::spawn(async move {
+        info!(worker_id = %worker_id, endpoint = %endpoint, "Starting ZMQ event subscriber loop");
+
+        loop {
+            let mut socket = SubSocket::new();
+            match socket.connect(&endpoint).await {
+                Ok(_) => {
+                    info!(worker_id = %worker_id, endpoint = %endpoint, "Connected to worker ZMQ endpoint");
+                    if let Err(e) = socket.subscribe("").await {
+                        error!(worker_id = %worker_id, error = %e, "Failed to subscribe to ZMQ topic");
+                        sleep(Duration::from_secs(2)).await;
+                        continue;
+                    }
+
+                    // Set status to Syncing upon connection
+                    if *worker.status.read() == WorkerSyncStatus::Init {
+                        worker.set_status(WorkerSyncStatus::Syncing);
+                    }
+
+                    while let Ok(msg) = socket.recv().await {
+                        // SGLang multipart message format: [topic, seq/payload] or single JSON frame
+                        for part in msg.iter() {
+                            if let Ok(event) = serde_json::from_slice::<KvEventMessage>(part) {
+                                processor.process_event(&worker, event);
+                            }
+                        }
+                    }
+
+                    warn!(worker_id = %worker_id, "ZMQ connection disconnected. Marking worker as STALE.");
+                    worker.set_status(WorkerSyncStatus::Stale);
+                }
+                Err(e) => {
+                    warn!(worker_id = %worker_id, endpoint = %endpoint, error = %e, "Failed to connect to worker ZMQ endpoint, retrying in 2s...");
+                }
+            }
+
+            sleep(Duration::from_secs(2)).await;
+        }
+    });
+}
+
+/// Spawns background ZMQ subscribers for all registered workers in the cluster.
+pub fn spawn_all_worker_zmq_subscribers(
+    workers: &DashMap<String, Arc<WorkerRuntimeState>>,
+    processor: Arc<KvEventProcessor>,
+) {
+    for entry in workers.iter() {
+        let worker = entry.value().clone();
+        if worker.config.zmq_endpoint.is_some() {
+            spawn_worker_zmq_subscriber(worker, processor.clone());
         }
     }
 }

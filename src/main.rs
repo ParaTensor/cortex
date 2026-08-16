@@ -66,6 +66,9 @@ async fn main() -> anyhow::Result<()> {
         workers.insert(w_cfg.id.clone(), worker_state);
     }
 
+    let kv_event_processor = Arc::new(cortex::zmq::KvEventProcessor::new(tree.clone()));
+    cortex::zmq::spawn_all_worker_zmq_subscribers(&workers, kv_event_processor);
+
     let scheduler = Arc::new(LocalityScheduler::new(
         config.scheduler.clone(),
         tree.clone(),

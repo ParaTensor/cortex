@@ -1,0 +1,26 @@
+host: "0.0.0.0"
+port: 8000
+
+scheduler:
+  kv_weight: 1.0
+  load_weight: 0.5
+  max_active_requests_per_worker: 64
+
+workers:
+  - id: "sgl-worker-01"
+    model: "meta-llama/Llama-3.1-8B-Instruct"
+    engine: "sglang"
+    http_endpoint: "http://127.0.0.1:8001"
+    zmq_endpoint: "tcp://127.0.0.1:5557"
+    role: "standard"
+    page_size: 16
+    weight: 100
+
+  - id: "sgl-worker-02"
+    model: "meta-llama/Llama-3.1-8B-Instruct"
+    engine: "sglang"
+    http_endpoint: "http://127.0.0.1:8002"
+    zmq_endpoint: "tcp://127.0.0.1:5558"
+    role: "standard"
+    page_size: 16
+    weight: 100

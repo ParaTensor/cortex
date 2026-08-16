@@ -19,3 +19,11 @@ Cargo.lock
 *.swp
 *.swo
 *~
+
+# Node.js & Frontend
+node_modules/
+dist/
+dist-ssr/
+*.local
+.npm
+.eslintcache

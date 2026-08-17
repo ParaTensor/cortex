@@ -14,10 +14,10 @@ use cortex::hasher::TokenizerRegistry;
 use cortex::ledger::{RadixHashTree, WorkerRuntimeState, WorkerSyncStatus};
 use cortex::proxy::{chat_completions_handler, cluster_status_handler, list_models_handler, AppState};
 use cortex::scheduler::LocalityScheduler;
-use cortex::zmq::{KvEventMessage, KvEventPayload, KvEventProcessor};
+use cortex::zmq::KvEventProcessor;
 
 #[tokio::test]
-async fn test_msgpack_event_processing_and_lru_removal() {
+async fn test_sglang_msgpack_event_processing_and_lru_removal() {
     let tree = Arc::new(RadixHashTree::new());
     let processor = KvEventProcessor::new(tree.clone());
 
@@ -34,30 +34,30 @@ async fn test_msgpack_event_processing_and_lru_removal() {
     };
     let worker = WorkerRuntimeState::new(worker_cfg);
 
-    // 1. Send Msgpack BlockStored event (seq 1)
-    let event1 = KvEventMessage {
-        seq: 1,
-        payload: KvEventPayload::BlockStored {
-            page_hashes: vec![1001, 1002, 1003],
-        },
-    };
-    let msgpack_bytes = rmp_serde::to_vec(&event1).expect("serialize msgpack");
-    let parsed_event = KvEventProcessor::parse_frame(&msgpack_bytes).expect("parse msgpack frame");
-    processor.process_event(&worker, parsed_event);
+    // 1. SGLang msgspec msgpack wire representation for BlockStored:
+    // [1.0, [["BlockStored", [1001, 1002, 1003], None, [1, 2, 3], 16, None, None]], 0]
+    let seq1_bytes = 1u64.to_be_bytes();
+    let stored_payload_hex = "93cb3ff00000000000009197ab426c6f636b53746f72656493cd03e9cd03eacd03ebc09301020310c0c000";
+    let stored_payload_bytes = hex::decode(stored_payload_hex).unwrap();
+
+    let events1 = KvEventProcessor::parse_sglang_multipart(&seq1_bytes, &stored_payload_bytes);
+    assert_eq!(events1.len(), 1);
+    assert_eq!(events1[0].seq, 1);
+    processor.process_event(&worker, events1[0].clone());
 
     assert_eq!(*worker.status.read(), WorkerSyncStatus::Ready);
     assert_eq!(tree.total_cached_blocks(), 3);
 
-    // 2. Send Msgpack BlockRemoved event (seq 2, LRU eviction of page 1003)
-    let event2 = KvEventMessage {
-        seq: 2,
-        payload: KvEventPayload::BlockRemoved {
-            page_hashes: vec![1001, 1002, 1003],
-        },
-    };
-    let msgpack_remove_bytes = rmp_serde::to_vec(&event2).expect("serialize msgpack");
-    let parsed_remove = KvEventProcessor::parse_frame(&msgpack_remove_bytes).expect("parse frame");
-    processor.process_event(&worker, parsed_remove);
+    // 2. SGLang msgspec msgpack wire representation for BlockRemoved:
+    // [2.0, [["BlockRemoved", [1003], None]], 0]
+    let seq2_bytes = 2u64.to_be_bytes();
+    let removed_payload_hex = "93cb40000000000000009193ac426c6f636b52656d6f76656491cd03ebc000";
+    let removed_payload_bytes = hex::decode(removed_payload_hex).unwrap();
+
+    let events2 = KvEventProcessor::parse_sglang_multipart(&seq2_bytes, &removed_payload_bytes);
+    assert_eq!(events2.len(), 1);
+    assert_eq!(events2[0].seq, 2);
+    processor.process_event(&worker, events2[0].clone());
 
     assert_eq!(tree.total_cached_blocks(), 2);
 }

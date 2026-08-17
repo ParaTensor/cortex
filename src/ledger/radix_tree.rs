@@ -58,12 +58,14 @@ impl RadixHashTree {
 
         let mut root = self.root.write();
 
-        fn prune_path(node: &mut TreeNode, worker_id: &str, hashes: &[i64]) {
+        fn prune_path(node: &mut TreeNode, worker_id: &str, hashes: &[i64]) -> bool {
             if hashes.is_empty() {
-                return;
+                return false;
             }
 
             let first = hashes[0];
+            let mut prune_this_child = false;
+
             if let Some(child) = node.children.get_mut(&first) {
                 if hashes.len() == 1 {
                     child.workers.remove(worker_id);
@@ -71,13 +73,46 @@ impl RadixHashTree {
                     prune_path(child, worker_id, &hashes[1..]);
                 }
 
+                // Also check if any child node's worker should be cleaned
+                if hashes.len() == 1 {
+                    for sub in child.children.values_mut() {
+                        sub.workers.remove(worker_id);
+                    }
+                }
+
+                child.children.retain(|_, v| !v.is_empty());
                 if child.is_empty() {
-                    node.children.remove(&first);
+                    prune_this_child = true;
                 }
             }
+
+            if prune_this_child {
+                node.children.remove(&first);
+            }
+
+            node.is_empty()
         }
 
+        // Try pruning along the specific prefix path
         prune_path(&mut root, worker_id, page_hashes);
+
+        // Also handle single-hash eviction directly
+        if page_hashes.len() == 1 {
+            let target_hash = page_hashes[0];
+            fn remove_hash_recursive(node: &mut TreeNode, worker_id: &str, target_hash: i64) {
+                if let Some(child) = node.children.get_mut(&target_hash) {
+                    child.workers.remove(worker_id);
+                    for sub in child.children.values_mut() {
+                        sub.workers.remove(worker_id);
+                    }
+                }
+                for child in node.children.values_mut() {
+                    remove_hash_recursive(child, worker_id, target_hash);
+                }
+                node.children.retain(|_, v| !v.is_empty());
+            }
+            remove_hash_recursive(&mut root, worker_id, target_hash);
+        }
     }
 
     /// Clears all blocks associated with a given worker

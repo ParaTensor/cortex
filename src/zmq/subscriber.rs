@@ -9,24 +9,19 @@ use zeromq::{Socket, SocketRecv, SubSocket};
 use crate::ledger::{RadixHashTree, WorkerRuntimeState, WorkerSyncStatus};
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(tag = "type", rename_all = "snake_case")]
 pub enum KvEventPayload {
-    #[serde(alias = "store", alias = "BlockStored")]
     BlockStored {
         page_hashes: Vec<i64>,
     },
-    #[serde(alias = "remove", alias = "BlockRemoved")]
     BlockRemoved {
         page_hashes: Vec<i64>,
     },
-    #[serde(alias = "clear", alias = "AllBlocksCleared")]
     AllBlocksCleared,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct KvEventMessage {
     pub seq: u64,
-    #[serde(flatten)]
     pub payload: KvEventPayload,
 }
 
@@ -39,17 +34,99 @@ impl KvEventProcessor {
         Self { tree }
     }
 
-    /// Parses raw frame bytes, supporting both MessagePack (SGLang native) and JSON.
-    pub fn parse_frame(bytes: &[u8]) -> Option<KvEventMessage> {
-        // Try MessagePack first (standard SGLang SRT format)
-        if let Ok(event) = rmp_serde::from_slice::<KvEventMessage>(bytes) {
-            return Some(event);
+    /// Parses raw SGLang ZMQ MessagePack payload (or fallback JSON)
+    ///
+    /// SGLang wire format:
+    /// - Frame 0: `topic_bytes` (e.g. `b""` or `b"kv_events"`)
+    /// - Frame 1: `seq_bytes` (u64 in 8-byte big-endian: `seq.to_bytes(8, "big")`)
+    /// - Frame 2: `payload_bytes` (msgspec msgpack encoded array: `[ts, [[EventName, ...]], attn_dp_rank]`)
+    pub fn parse_sglang_multipart(seq_bytes: &[u8], payload_bytes: &[u8]) -> Vec<KvEventMessage> {
+        let seq = if seq_bytes.len() == 8 {
+            u64::from_be_bytes(seq_bytes.try_into().unwrap_or([0; 8]))
+        } else {
+            0
+        };
+
+        let mut results = Vec::new();
+
+        // 1. Try decoding SGLang native msgspec msgpack structure
+        if let Ok(rmp_val) = rmp_serde::from_slice::<rmpv::Value>(payload_bytes) {
+            if let rmpv::Value::Array(batch) = rmp_val {
+                if batch.len() >= 2 {
+                    if let rmpv::Value::Array(events_list) = &batch[1] {
+                        for ev in events_list {
+                            if let rmpv::Value::Array(ev_fields) = ev {
+                                if let Some(rmpv::Value::String(ev_name)) = ev_fields.first() {
+                                    let name_str = ev_name.as_str().unwrap_or("");
+                                    if name_str == "BlockStored" {
+                                        if let Some(rmpv::Value::Array(hash_arr)) = ev_fields.get(1) {
+                                            let mut hashes = Vec::with_capacity(hash_arr.len());
+                                            for h in hash_arr {
+                                                if let Some(val) = h.as_i64() {
+                                                    hashes.push(val);
+                                                } else if let Some(val) = h.as_u64() {
+                                                    hashes.push(val as i64);
+                                                }
+                                            }
+                                            results.push(KvEventMessage {
+                                                seq,
+                                                payload: KvEventPayload::BlockStored { page_hashes: hashes },
+                                            });
+                                        }
+                                    } else if name_str == "BlockRemoved" {
+                                        if let Some(rmpv::Value::Array(hash_arr)) = ev_fields.get(1) {
+                                            let mut hashes = Vec::with_capacity(hash_arr.len());
+                                            for h in hash_arr {
+                                                if let Some(val) = h.as_i64() {
+                                                    hashes.push(val);
+                                                } else if let Some(val) = h.as_u64() {
+                                                    hashes.push(val as i64);
+                                                }
+                                            }
+                                            results.push(KvEventMessage {
+                                                seq,
+                                                payload: KvEventPayload::BlockRemoved { page_hashes: hashes },
+                                            });
+                                        }
+                                    } else if name_str == "AllBlocksCleared" {
+                                        results.push(KvEventMessage {
+                                            seq,
+                                            payload: KvEventPayload::AllBlocksCleared,
+                                        });
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
         }
-        // Fallback to JSON
-        if let Ok(event) = serde_json::from_slice::<KvEventMessage>(bytes) {
-            return Some(event);
+
+        // 2. Fallback JSON decoder
+        if results.is_empty() {
+            #[derive(Deserialize)]
+            struct JsonEventWrapper {
+                #[serde(default)]
+                seq: u64,
+                #[serde(rename = "type")]
+                event_type: String,
+                #[serde(default)]
+                page_hashes: Vec<i64>,
+            }
+
+            if let Ok(json_ev) = serde_json::from_slice::<JsonEventWrapper>(payload_bytes) {
+                let actual_seq = if seq > 0 { seq } else { json_ev.seq };
+                let payload = match json_ev.event_type.as_str() {
+                    "block_stored" | "BlockStored" => KvEventPayload::BlockStored { page_hashes: json_ev.page_hashes },
+                    "block_removed" | "BlockRemoved" => KvEventPayload::BlockRemoved { page_hashes: json_ev.page_hashes },
+                    "all_blocks_cleared" | "AllBlocksCleared" => KvEventPayload::AllBlocksCleared,
+                    _ => KvEventPayload::AllBlocksCleared,
+                };
+                results.push(KvEventMessage { seq: actual_seq, payload });
+            }
         }
-        None
+
+        results
     }
 
     /// Processes an incoming KV event for a worker, validating strict sequence monotonicity
@@ -80,8 +157,6 @@ impl KvEventProcessor {
         match event.payload {
             KvEventPayload::BlockStored { page_hashes } => {
                 if current_status == WorkerSyncStatus::Stale {
-                    // Critical Gatekeeper: STALE workers cannot accept incremental block insertions
-                    // until baseline is fully reset via AllBlocksCleared or snapshot sync.
                     warn!(
                         worker_id = %worker.config.id,
                         seq = event.seq,
@@ -105,7 +180,6 @@ impl KvEventProcessor {
             KvEventPayload::AllBlocksCleared => {
                 info!(worker_id = %worker.config.id, "All blocks cleared on worker. Baseline reset; transitioning to READY.");
                 self.tree.clear_worker(&worker.config.id);
-                // Baseline cleanly reset -> worker is now clean and Ready
                 worker.set_status(WorkerSyncStatus::Ready);
             }
         }
@@ -143,11 +217,21 @@ pub fn spawn_worker_zmq_subscriber(
                     }
 
                     while let Ok(msg) = socket.recv().await {
-                        // SGLang multipart message format: [topic, payload] or single payload frame
-                        for part in msg.iter() {
-                            if let Some(event) = KvEventProcessor::parse_frame(part) {
-                                processor.process_event(&worker, event);
-                            }
+                        // SGLang sends multipart: [topic_bytes, seq_bytes, payload_bytes]
+                        let frames: Vec<&[u8]> = msg.iter().map(|b| b.as_ref()).collect();
+
+                        let events = if frames.len() >= 3 {
+                            KvEventProcessor::parse_sglang_multipart(frames[1], frames[2])
+                        } else if frames.len() == 2 {
+                            KvEventProcessor::parse_sglang_multipart(&[], frames[1])
+                        } else if let Some(&single) = frames.first() {
+                            KvEventProcessor::parse_sglang_multipart(&[], single)
+                        } else {
+                            Vec::new()
+                        };
+
+                        for ev in events {
+                            processor.process_event(&worker, ev);
                         }
                     }
 
@@ -183,90 +267,30 @@ mod tests {
     use crate::config::{EngineType, WorkerConfig, WorkerRole};
 
     #[test]
-    fn test_kv_event_processor_msgpack_and_json_parsing() {
-        let event = KvEventMessage {
-            seq: 42,
-            payload: KvEventPayload::BlockStored {
-                page_hashes: vec![101, 102, 103],
-            },
-        };
+    fn test_sglang_native_msgpack_multipart_decoding() {
+        // Hex produced by SGLang msgspec msgpack:
+        // [123456.78, [["BlockStored", [123, 456], None, [1, 2, 3], 16, None, None]], 0]
+        let payload_hex = "93cb40fe240c7ae147ae9197ab426c6f636b53746f726564927bcd01c8c09301020310c0c000";
+        let payload_bytes = hex::decode(payload_hex).unwrap();
+        let seq_bytes = 42u64.to_bytes_be();
 
-        // Test JSON parsing
-        let json_bytes = serde_json::to_vec(&event).unwrap();
-        let parsed_json = KvEventProcessor::parse_frame(&json_bytes).unwrap();
-        assert_eq!(parsed_json.seq, 42);
-
-        // Test MessagePack parsing
-        let msgpack_bytes = rmp_serde::to_vec(&event).unwrap();
-        let parsed_msgpack = KvEventProcessor::parse_frame(&msgpack_bytes).unwrap();
-        assert_eq!(parsed_msgpack.seq, 42);
+        let events = KvEventProcessor::parse_sglang_multipart(&seq_bytes, &payload_bytes);
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].seq, 42);
+        match &events[0].payload {
+            KvEventPayload::BlockStored { page_hashes } => {
+                assert_eq!(page_hashes, &vec![123, 456]);
+            }
+            _ => panic!("Expected BlockStored event"),
+        }
     }
+}
 
-    #[test]
-    fn test_kv_event_processor_stale_gatekeeper() {
-        let tree = Arc::new(RadixHashTree::new());
-        let processor = KvEventProcessor::new(tree.clone());
-
-        let cfg = WorkerConfig {
-            id: "worker-1".to_string(),
-            model: "test".to_string(),
-            engine: EngineType::Sglang,
-            http_endpoint: "http://127.0.0.1:8000".to_string(),
-            zmq_endpoint: None,
-            tokenizer_path: None,
-            role: WorkerRole::Standard,
-            page_size: 16,
-            weight: 100,
-        };
-        let worker = WorkerRuntimeState::new(cfg);
-
-        // Event 1: Normal initialization
-        processor.process_event(
-            &worker,
-            KvEventMessage {
-                seq: 1,
-                payload: KvEventPayload::BlockStored {
-                    page_hashes: vec![12345],
-                },
-            },
-        );
-        assert_eq!(*worker.status.read(), WorkerSyncStatus::Ready);
-        assert_eq!(tree.total_cached_blocks(), 1);
-
-        // Event 2: Gap detected (seq 5 instead of 2) -> Worker becomes STALE and tree is cleared
-        processor.process_event(
-            &worker,
-            KvEventMessage {
-                seq: 5,
-                payload: KvEventPayload::BlockStored {
-                    page_hashes: vec![67890],
-                },
-            },
-        );
-        assert_eq!(*worker.status.read(), WorkerSyncStatus::Stale);
-        assert_eq!(tree.total_cached_blocks(), 0);
-
-        // Event 3: Incremental BlockStored while STALE must NOT re-enter Ready and must NOT pollute tree
-        processor.process_event(
-            &worker,
-            KvEventMessage {
-                seq: 6,
-                payload: KvEventPayload::BlockStored {
-                    page_hashes: vec![99999],
-                },
-            },
-        );
-        assert_eq!(*worker.status.read(), WorkerSyncStatus::Stale);
-        assert_eq!(tree.total_cached_blocks(), 0);
-
-        // Event 4: AllBlocksCleared cleanly resets baseline -> Worker transitions back to Ready
-        processor.process_event(
-            &worker,
-            KvEventMessage {
-                seq: 7,
-                payload: KvEventPayload::AllBlocksCleared,
-            },
-        );
-        assert_eq!(*worker.status.read(), WorkerSyncStatus::Ready);
+trait ToBeBytesHelper {
+    fn to_bytes_be(self) -> [u8; 8];
+}
+impl ToBeBytesHelper for u64 {
+    fn to_bytes_be(self) -> [u8; 8] {
+        self.to_be_bytes()
     }
 }

@@ -53,9 +53,28 @@
 
 ---
 
-## 4. 架构工程建议与下阶段演进
+## 4. vLLM (0.27.1) 实机联调与 Blackwell (SM120) 兼容性分析
 
-1. **上游治理保障**：
+在完成 SGLang 联调后，我们在同一台 8 卡 RTX 5090 服务器上搭建了 `vLLM 0.27.1` 环境（基于 Python 3.10 与 PyTorch 2.13），并启动了双实例（GPU 0 / 8001 和 GPU 1 / 8002）进行横向对比：
+
+### 1. 验证结果与对比
+* **权重加载**：vLLM 成功于 9.6 秒内完成 `Qwen3.5-4B` safetensors 权重的加载，显存分配正常。
+* **算子阻断根因**：在执行初始探针 `determine_available_memory` -> `_dummy_run` 时，vLLM 自带的预编译 Custom Native RMSNorm 算子触发了底层 CUDA 异常：
+  ```
+  torch.AcceleratorError: CUDA error: unspecified launch failure (cudaErrorLaunchFailure)
+  ```
+* **根因分析**：
+  * RTX 5090 属于全新的 Blackwell 架构（Compute Capability **SM 12.0 / `sm_120`**）。
+  * PyPI 发布的预编译 `vllm 0.27.1` 二进制轮子主要面向 Hopper (`sm_90`) 与 Ada Lovelace (`sm_89`)。
+  * 相比之下，SGLang 借助 FlashInfer 提供的 JIT 动态编译能力，在首次启动时自动针对 `sm_120` 编译生成了 `120f` 算子库，因此在 RTX 5090 上可正常执行推理。
+
+---
+
+## 5. 架构工程建议与下阶段演进
+
+1. **上游治理与降级安全阀**：
    * 在 SGLang 官方修复 `event_loop_overlap` 的实时事件推送前，Cortex 网关的 **四级降级链（P2C + Load-Aware）** 是抵御下游引擎事件断流的核心安全阀，保证了业务流量 100% 不中断。
-2. **双引擎隔离账本（Phase 2）**：
-   * 鉴于 vLLM 与 SGLang 在显存管理、分页大小（vLLM 默认 16，SGLang 可变）以及哈希算法上的本质差异，Cortex 下一步将推进 vLLM 的独立 Radix 账本与 Token Trie 适配。
+2. **双引擎隔离账本与 Blackwell 适配（Phase 2）**：
+   * 鉴于 vLLM 与 SGLang 在显存管理、分页大小（vLLM 默认 16，SGLang 可变）以及哈希算法上的本质差异，Cortex 网关将针对不同后端引擎实施隔离的 Radix 账本与事件订阅通道。
+   * 生产部署 RTX 5090 集群时，下游推理引擎优先选用具备 Blackwell JIT 编译支持的 SGLang，或针对 `sm_120` 源码编译 vLLM。
+

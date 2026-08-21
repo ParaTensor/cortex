@@ -137,7 +137,8 @@ impl KvEventProcessor {
         let expected_seq = *last_seq_guard + 1;
 
         // 1. Seq Monotonicity Check
-        if *last_seq_guard > 0 && event.seq != expected_seq {
+        // SGLang sends batches where all events within the same multipart message share the same sequence number.
+        if *last_seq_guard > 0 && event.seq != *last_seq_guard && event.seq != expected_seq {
             warn!(
                 worker_id = %worker.config.id,
                 expected_seq = expected_seq,

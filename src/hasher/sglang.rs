@@ -29,8 +29,8 @@ pub fn compute_sglang_page_hashes(token_ids: &[u32], page_size: usize) -> Vec<i6
         }
 
         let digest: [u8; 32] = hasher.finalize().into();
-        // First 8 bytes converted to signed i64 (SGLang standard radix page hash representation)
-        let hash_i64 = i64::from_le_bytes(digest[0..8].try_into().expect("slice with exact length"));
+        // First 8 bytes converted to signed i64 in big-endian (SGLang standard radix page hash representation)
+        let hash_i64 = i64::from_be_bytes(digest[0..8].try_into().expect("slice with exact length"));
         page_hashes.push(hash_i64);
         prev_digest = Some(digest);
     }
@@ -58,5 +58,24 @@ mod tests {
         assert_eq!(hashes1, hashes2);
         // Ensure cascading hash dependency
         assert_ne!(hashes1[0], hashes1[1]);
+    }
+
+    #[test]
+    fn test_sglang_golden_vectors() {
+        // Golden vector from SGLang: chain([1,2,3,4], 4) -> [-3488128144981237669]
+        let got = compute_sglang_page_hashes(&[1, 2, 3, 4], 4);
+        assert_eq!(got, vec![-3488128144981237669_i64]);
+
+        // Golden vector from SGLang: chain([10,20,30,40,50,60,70,80], 2)
+        let got2 = compute_sglang_page_hashes(&[10, 20, 30, 40, 50, 60, 70, 80], 2);
+        assert_eq!(
+            got2,
+            vec![
+                978178666101069530_i64,
+                -895308556211281782_i64,
+                -8033692805846017938_i64,
+                835415944263129316_i64,
+            ]
+        );
     }
 }

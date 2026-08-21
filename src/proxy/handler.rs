@@ -12,7 +12,7 @@ use serde_json::Value;
 use tracing::{error, warn};
 
 use crate::config::CortexConfig;
-use crate::hasher::{compute_sglang_page_hashes, ChatMessage, TokenizerRegistry};
+use crate::hasher::{ChatMessage, TokenizerRegistry};
 use crate::ledger::{RadixHashTree, WorkerRuntimeState};
 use crate::scheduler::LocalityScheduler;
 
@@ -38,10 +38,8 @@ pub async fn chat_completions_handler(
 
     let page_size = 16;
 
-    // 1. Tokenize messages or prompt with Fast Tokenizer & LRU Cache
-    let mut page_hashes = Vec::new();
-
-    if let Some(messages_val) = payload.get("messages").and_then(|m| m.as_array()) {
+    // 1. Tokenize messages or prompt with Fast Tokenizer & Zero-Allocation LRU Cache
+    let page_hashes: Arc<Vec<i64>> = if let Some(messages_val) = payload.get("messages").and_then(|m| m.as_array()) {
         let mut chat_messages = Vec::with_capacity(messages_val.len());
         for msg in messages_val {
             let role = msg.get("role").and_then(|r| r.as_str()).unwrap_or("user");
@@ -52,14 +50,20 @@ pub async fn chat_completions_handler(
             });
         }
 
-        if let Some(token_ids) = state.tokenizer_registry.tokenize_chat(model, &chat_messages) {
-            page_hashes = compute_sglang_page_hashes(&token_ids, page_size);
-        }
+        state
+            .tokenizer_registry
+            .tokenize_and_hash_chat(model, &chat_messages, page_size)
+            .map(|out| out.page_hashes)
+            .unwrap_or_else(|| Arc::new(Vec::new()))
     } else if let Some(prompt) = payload.get("prompt").and_then(|p| p.as_str()) {
-        if let Some(token_ids) = state.tokenizer_registry.tokenize_text(model, prompt) {
-            page_hashes = compute_sglang_page_hashes(&token_ids, page_size);
-        }
-    }
+        state
+            .tokenizer_registry
+            .tokenize_and_hash_text(model, prompt, page_size)
+            .map(|out| out.page_hashes)
+            .unwrap_or_else(|| Arc::new(Vec::new()))
+    } else {
+        Arc::new(Vec::new())
+    };
 
     // 2. Schedule request using 4-tier fallback
     let decision = match state.scheduler.select_worker(model, &page_hashes, None) {

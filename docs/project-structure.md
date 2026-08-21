@@ -18,8 +18,11 @@ cortex/
 │   ├── project-structure.md      # 工程结构与模块说明（本文档）
 │   ├── ledger-sync.md            # 账本同步状态机规范
 │   ├── tokenizer-hash-alignment.md # Tokenizer 与 Block Hash 对齐规范
+│   ├── tokenizer-optimization-roadmap.md # 分词与模板渲染内部优化架构路线
 │   ├── runtime-failure-semantics.md # 运行时与故障降级语义
-│   └── ha-deployment.md          # 高可用部署与容量模型
+│   ├── ha-deployment.md          # 高可用部署与容量模型
+│   ├── sglang-live-integration-report.md # RTX 5090 集群联调与架构复盘报告
+│   └── rtx-pro-6000-live-benchmark-report.md # RTX PRO 6000 硬件全链路实测报告
 ├── src/                          # Rust 后端高性能核心实现
 │   ├── config/                   # 配置解析与模型配置
 │   ├── hasher/                   # HashConfig 指纹与递归页哈希算法

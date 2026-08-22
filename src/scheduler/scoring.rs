@@ -9,6 +9,7 @@ use crate::ledger::{RadixHashTree, WorkerRuntimeState, WorkerSyncStatus};
 pub enum RoutingMode {
     ExactKvEvents,
     LoadAware,
+    SessionAffinity,
     FallbackP2c,
     FallbackRoundRobin,
 }
@@ -18,6 +19,7 @@ impl RoutingMode {
         match self {
             Self::ExactKvEvents => "exact_kv_events",
             Self::LoadAware => "load_aware",
+            Self::SessionAffinity => "session_affinity",
             Self::FallbackP2c => "fallback_p2c",
             Self::FallbackRoundRobin => "fallback_round_robin",
         }

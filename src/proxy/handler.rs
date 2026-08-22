@@ -9,12 +9,17 @@ use axum::{
 };
 use futures_util::StreamExt;
 use serde_json::Value;
-use tracing::{error, warn};
+use tracing::{error, info, warn};
 
 use crate::config::CortexConfig;
 use crate::hasher::{ChatMessage, TokenizerRegistry};
 use crate::ledger::{RadixHashTree, WorkerRuntimeState};
-use crate::scheduler::LocalityScheduler;
+use crate::scheduler::{LocalityScheduler, RoutingMode, SchedulingDecision};
+use crate::session_ledger::{SessionLedger, SessionPublishRequest};
+
+/// zene outbound session headers (docs/agent-inference-context.md).
+const HEADER_ZENE_SESSION: &str = "x-zene-session-id";
+const HEADER_ZENE_EPOCH: &str = "x-zene-context-epoch";
 
 #[derive(Clone)]
 pub struct AppState {
@@ -23,6 +28,7 @@ pub struct AppState {
     pub tree: Arc<RadixHashTree>,
     pub workers: Arc<dashmap::DashMap<String, Arc<WorkerRuntimeState>>>,
     pub tokenizer_registry: Arc<TokenizerRegistry>,
+    pub sessions: Arc<SessionLedger>,
     pub http_client: reqwest::Client,
 }
 
@@ -66,13 +72,51 @@ pub async fn chat_completions_handler(
     };
 
     // 2. Schedule request using 4-tier fallback
-    let decision = match state.scheduler.select_worker(model, &page_hashes, None) {
+    let mut decision = match state.scheduler.select_worker(model, &page_hashes, None) {
         Some(d) => d,
         None => {
             warn!(model = %model, "No available worker found for request");
             return Err(StatusCode::SERVICE_UNAVAILABLE);
         }
     };
+
+    // 2b. Session affinity override (zene linkage): when the agent-declared
+    // epoch matches the published baseline and Tier-1 exact matching found
+    // nothing, prefer the worker that served the previous turn — its engine
+    // radix cache almost certainly still holds the canonical prefix even when
+    // our ZMQ ledger is cold.
+    let zene_session = headers
+        .get(HEADER_ZENE_SESSION)
+        .and_then(|v| v.to_str().ok())
+        .map(|s| s.to_string());
+    let zene_epoch = headers
+        .get(HEADER_ZENE_EPOCH)
+        .and_then(|v| v.to_str().ok())
+        .and_then(|s| s.parse::<u64>().ok());
+    if let (Some(session_id), Some(epoch)) = (&zene_session, zene_epoch) {
+        if matches!(
+            decision.mode,
+            RoutingMode::FallbackP2c | RoutingMode::FallbackRoundRobin | RoutingMode::LoadAware
+        ) {
+            if let Some(sticky_id) = state.sessions.sticky_worker(session_id, epoch) {
+                let sticky_ok = state.workers.get(&sticky_id).is_some_and(|w| {
+                    w.config.model == model
+                        && w.get_active_requests() < state.config.scheduler.max_active_requests_per_worker
+                });
+                if sticky_ok {
+                    if let Some(w) = state.workers.get(&sticky_id) {
+                        decision = SchedulingDecision {
+                            worker_id: sticky_id.clone(),
+                            http_endpoint: w.config.http_endpoint.clone(),
+                            matched_pages: 0,
+                            mode: RoutingMode::SessionAffinity,
+                        };
+                    }
+                }
+            }
+        }
+        state.sessions.record_assignment(session_id, epoch, &decision.worker_id);
+    }
 
     let worker = match state.workers.get(&decision.worker_id) {
         Some(w) => w.clone(),
@@ -149,6 +193,44 @@ pub async fn chat_completions_handler(
     *response.headers_mut() = response_headers;
 
     Ok(response)
+}
+
+/// zene linkage: agent publishes its canonical prefix baseline after a
+/// compaction / system resize (epoch++). See docs/agent-inference-context.md.
+/// This is the cold-start snapshot channel: a freshly (re)started gateway
+/// learns the session's anchor boundaries and fingerprint without replaying
+/// traffic, and re-arms sticky affinity on the next turn.
+pub async fn session_publish_handler(
+    State(state): State<AppState>,
+    axum::extract::Path(session_id): axum::extract::Path<String>,
+    Json(req): Json<SessionPublishRequest>,
+) -> impl IntoResponse {
+    let accepted = state.sessions.publish(&session_id, &req);
+    if accepted {
+        info!(
+            session_id = %session_id,
+            epoch = req.epoch,
+            message_count = req.message_count,
+            anchors = req.anchor_boundaries.as_ref().map(|a| a.len()).unwrap_or(0),
+            "zene session baseline published"
+        );
+        StatusCode::OK
+    } else {
+        // Stale epoch delivery; the agent should treat this as idempotent success.
+        warn!(session_id = %session_id, epoch = req.epoch, "stale session publish rejected");
+        StatusCode::CONFLICT
+    }
+}
+
+/// zene linkage: run teardown. Drops routing metadata for the session.
+pub async fn session_close_handler(
+    State(state): State<AppState>,
+    axum::extract::Path(session_id): axum::extract::Path<String>,
+) -> impl IntoResponse {
+    if state.sessions.close(&session_id) {
+        info!(session_id = %session_id, "zene session closed");
+    }
+    StatusCode::NO_CONTENT
 }
 
 pub async fn list_models_handler(State(state): State<AppState>) -> impl IntoResponse {

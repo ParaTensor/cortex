@@ -133,12 +133,28 @@ impl KvEventProcessor {
     /// and enforcing the ledger synchronization gatekeeper.
     pub fn process_event(&self, worker: &WorkerRuntimeState, event: KvEventMessage) {
         let mut last_seq_guard = worker.last_seq.write();
-        let current_status = *worker.status.read();
+        let mut current_status = *worker.status.read();
         let expected_seq = *last_seq_guard + 1;
 
-        // 1. Seq Monotonicity Check
-        // SGLang sends batches where all events within the same multipart message share the same sequence number.
-        if *last_seq_guard > 0 && event.seq != *last_seq_guard && event.seq != expected_seq {
+        // 1a. Engine restart detection: seq regressed below our watermark.
+        // The worker process was recycled (crash / redeploy) and its Radix tree
+        // starts from scratch, so previously synced blocks are phantom entries.
+        // Full resync: drop the per-worker subtree and adopt the new stream.
+        if *last_seq_guard > 0 && event.seq < *last_seq_guard {
+            warn!(
+                worker_id = %worker.config.id,
+                previous_seq = *last_seq_guard,
+                actual_seq = event.seq,
+                "KV event sequence regression detected (engine restart?). Resetting worker ledger and resyncing."
+            );
+            self.tree.clear_worker(&worker.config.id);
+            *last_seq_guard = event.seq;
+            worker.set_status(WorkerSyncStatus::Syncing);
+            current_status = WorkerSyncStatus::Syncing;
+        } else if *last_seq_guard > 0 && event.seq != *last_seq_guard && event.seq != expected_seq {
+            // 1b. True forward gap: incremental events were lost on the wire.
+            // The ledger is provably incomplete — prune it and gate further
+            // incremental writes until an explicit resync signal arrives.
             warn!(
                 worker_id = %worker.config.id,
                 expected_seq = expected_seq,
@@ -217,7 +233,25 @@ pub fn spawn_worker_zmq_subscriber(
                         worker.set_status(WorkerSyncStatus::Syncing);
                     }
 
-                    while let Ok(msg) = socket.recv().await {
+                    // Watchdog: PUB/SUB offers no liveness signal, and zeromq-rs
+                    // recv() may hang forever on a silently-dead peer (e.g. the
+                    // worker container was recycled). Recycle the subscription
+                    // when the stream stays silent, forcing a fresh TCP connect;
+                    // ledger integrity across restarts is arbitrated by seq.
+                    loop {
+                        let recv = tokio::time::timeout(Duration::from_secs(30), socket.recv()).await;
+                        let msg = match recv {
+                            Ok(Ok(msg)) => msg,
+                            Ok(Err(e)) => {
+                                warn!(worker_id = %worker_id, error = %e, "ZMQ receive failed; reconnecting.");
+                                break;
+                            }
+                            Err(_) => {
+                                warn!(worker_id = %worker_id, idle_secs = 30, "ZMQ stream silent for 30s; recycling subscription to detect dead peer.");
+                                break;
+                            }
+                        };
+
                         // SGLang sends multipart: [topic_bytes, seq_bytes, payload_bytes]
                         let frames: Vec<&[u8]> = msg.iter().map(|b| b.as_ref()).collect();
 
@@ -231,13 +265,14 @@ pub fn spawn_worker_zmq_subscriber(
                             Vec::new()
                         };
 
+                        worker.update_heartbeat();
+
                         for ev in events {
                             processor.process_event(&worker, ev);
                         }
                     }
 
-                    warn!(worker_id = %worker_id, "ZMQ connection disconnected. Marking worker as STALE.");
-                    worker.set_status(WorkerSyncStatus::Stale);
+                    warn!(worker_id = %worker_id, "ZMQ connection interrupted. Entering reconnect backoff; ledger consistency will be re-arbitrated by sequence numbers.");
                 }
                 Err(e) => {
                     warn!(worker_id = %worker_id, endpoint = %endpoint, error = %e, "Failed to connect to worker ZMQ endpoint, retrying in 2s...");
@@ -273,7 +308,7 @@ mod tests {
         // [123456.78, [["BlockStored", [123, 456], None, [1, 2, 3], 16, None, None]], 0]
         let payload_hex = "93cb40fe240c7ae147ae9197ab426c6f636b53746f726564927bcd01c8c09301020310c0c000";
         let payload_bytes = hex::decode(payload_hex).unwrap();
-        let seq_bytes = 42u64.to_bytes_be();
+        let seq_bytes: [u8; 8] = 42u64.to_be_bytes();
 
         let events = KvEventProcessor::parse_sglang_multipart(&seq_bytes, &payload_bytes);
         assert_eq!(events.len(), 1);
@@ -284,14 +319,5 @@ mod tests {
             }
             _ => panic!("Expected BlockStored event"),
         }
-    }
-}
-
-trait ToBeBytesHelper {
-    fn to_bytes_be(self) -> [u8; 8];
-}
-impl ToBeBytesHelper for u64 {
-    fn to_bytes_be(self) -> [u8; 8] {
-        self.to_be_bytes()
     }
 }

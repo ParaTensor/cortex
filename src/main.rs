@@ -19,6 +19,29 @@ use cortex::proxy::{
 };
 use cortex::scheduler::LocalityScheduler;
 
+/// Resolves the effective chat template for a tokenizer path.
+///
+/// Alignment contract (docs/tokenizer-hash-alignment.md): the gateway MUST hash
+/// the exact same token sequence the engine will see. Engines render prompts
+/// with the model's Jinja chat template, so when the operator has not pinned an
+/// explicit template we auto-discover `chat_template` from the sibling
+/// `tokenizer_config.json` instead of falling back to naive concatenation
+/// (which would desynchronize page-0 hashes and permanently break exact KV matching).
+fn resolve_chat_template(tok_path: &str, configured: Option<String>) -> Option<String> {
+    if configured.is_some() {
+        return configured;
+    }
+    let cfg_path = std::path::Path::new(tok_path)
+        .parent()?
+        .join("tokenizer_config.json");
+    let raw = std::fs::read_to_string(&cfg_path).ok()?;
+    let value: serde_json::Value = serde_json::from_str(&raw).ok()?;
+    value
+        .get("chat_template")
+        .and_then(|t| t.as_str())
+        .map(|s| s.to_string())
+}
+
 #[derive(Parser, Debug)]
 #[command(name = "cortex", about = "High-performance cluster KV-Cache aware & PD disaggregation inference gateway")]
 struct Args {
@@ -83,7 +106,12 @@ async fn main() -> anyhow::Result<()> {
 
     for model_cfg in &config.models {
         if let Some(tok_path) = &model_cfg.tokenizer_path {
-            match TokenizerEngine::from_file(tok_path, model_cfg.chat_template.clone()) {
+            let chat_template =
+                resolve_chat_template(tok_path, model_cfg.chat_template.clone());
+            if model_cfg.chat_template.is_none() && chat_template.is_some() {
+                info!(model_id = %model_cfg.model_id, "Discovered chat template from tokenizer_config.json");
+            }
+            match TokenizerEngine::from_file(tok_path, chat_template) {
                 Ok(engine) => {
                     info!(model_id = %model_cfg.model_id, path = %tok_path, "Successfully loaded and registered tokenizer");
                     tokenizer_registry.register(&model_cfg.model_id, engine);
@@ -99,7 +127,8 @@ async fn main() -> anyhow::Result<()> {
     for w_cfg in &config.workers {
         if let Some(tok_path) = &w_cfg.tokenizer_path {
             if !tokenizer_registry.contains_model(&w_cfg.model) {
-                match TokenizerEngine::from_file(tok_path, None) {
+                let chat_template = resolve_chat_template(tok_path, None);
+                match TokenizerEngine::from_file(tok_path, chat_template) {
                     Ok(engine) => {
                         info!(model_id = %w_cfg.model, path = %tok_path, "Successfully loaded worker tokenizer");
                         tokenizer_registry.register(&w_cfg.model, engine);

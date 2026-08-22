@@ -14,6 +14,7 @@ use cortex::hasher::TokenizerRegistry;
 use cortex::ledger::{RadixHashTree, WorkerRuntimeState, WorkerSyncStatus};
 use cortex::proxy::{chat_completions_handler, cluster_status_handler, list_models_handler, AppState};
 use cortex::scheduler::LocalityScheduler;
+use cortex::session_ledger::SessionLedger;
 use cortex::zmq::KvEventProcessor;
 
 #[tokio::test]
@@ -94,6 +95,7 @@ async fn test_axum_http_api_cluster_status_and_models() {
         tree,
         workers,
         tokenizer_registry: Arc::new(TokenizerRegistry::new(100)),
+        sessions: Arc::new(SessionLedger::new()),
         http_client: reqwest::Client::new(),
     };
 

@@ -1,7 +1,7 @@
 use std::net::SocketAddr;
 use std::sync::Arc;
 use axum::{
-    routing::{get, post},
+    routing::{delete, get, post},
     Router,
 };
 use clap::Parser;
@@ -15,8 +15,10 @@ use cortex::hasher::{TokenizerEngine, TokenizerRegistry};
 use cortex::ledger::{RadixHashTree, WorkerRuntimeState};
 use cortex::metrics::{health_live, health_ready};
 use cortex::proxy::{
-    chat_completions_handler, cluster_status_handler, list_models_handler, AppState,
+    chat_completions_handler, cluster_status_handler, list_models_handler, session_close_handler,
+    session_publish_handler, AppState,
 };
+use cortex::session_ledger::SessionLedger;
 use cortex::scheduler::LocalityScheduler;
 
 /// Resolves the effective chat template for a tokenizer path.
@@ -147,6 +149,7 @@ async fn main() -> anyhow::Result<()> {
         tree,
         workers,
         tokenizer_registry,
+        sessions: Arc::new(SessionLedger::new()),
         http_client: reqwest::Client::builder().build()?,
     };
 
@@ -156,6 +159,12 @@ async fn main() -> anyhow::Result<()> {
         .route("/health/ready", get(health_ready))
         // Cluster Admin & Diagnostics API
         .route("/api/v1/cluster/status", get(cluster_status_handler))
+        // zene session linkage (docs/agent-inference-context.md)
+        .route(
+            "/v1/zene/sessions/{session_id}/publish",
+            post(session_publish_handler),
+        )
+        .route("/v1/zene/sessions/{session_id}", delete(session_close_handler))
         // OpenAI-compatible endpoints
         .route("/v1/models", get(list_models_handler))
         .route("/v1/chat/completions", post(chat_completions_handler))

@@ -27,3 +27,13 @@ export interface ClusterStats {
   loadAwareRequests: number
   fallbackRequests: number
 }
+
+export interface RoutingStats {
+  exactKvEvents: number
+  sessionAffinity: number
+  loadAware: number
+  fallbackP2c: number
+  fallbackRoundRobin: number
+  anchorAlignedHits: number
+  avgExactHitPages: number
+}

@@ -13,6 +13,16 @@ describe('ClusterOverview Component', () => {
           ready_workers: 2,
           total_active_requests: 3,
           total_cached_blocks: 1540,
+          total_sessions: 4,
+          routing_stats: {
+            exact_kv_events: 12,
+            session_affinity: 3,
+            load_aware: 0,
+            fallback_p2c: 5,
+            fallback_round_robin: 0,
+            anchor_aligned_hits: 2,
+            avg_exact_hit_pages: 18.5,
+          },
           workers: [
             {
               id: 'sgl-worker-01',
@@ -49,5 +59,8 @@ describe('ClusterOverview Component', () => {
     expect(screen.getByText('集群概览')).toBeDefined()
     expect(await screen.findByText('sgl-worker-01')).toBeDefined()
     expect(await screen.findByText('sgl-worker-02')).toBeDefined()
+    expect(await screen.findByText('真实 KV 命中')).toBeDefined()
+    expect(screen.getAllByText('12').length).toBeGreaterThan(0)
+    expect(screen.getAllByText('60%').length).toBeGreaterThan(0)
   })
 })

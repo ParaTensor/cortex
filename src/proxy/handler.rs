@@ -120,9 +120,14 @@ pub async fn chat_completions_handler(
             for msg in messages_val {
                 let role = msg.get("role").and_then(|r| r.as_str()).unwrap_or("user");
                 let content = msg.get("content").and_then(|c| c.as_str()).unwrap_or("");
+                let has_tool_calls = msg
+                    .get("tool_calls")
+                    .and_then(|t| t.as_array())
+                    .is_some_and(|a| !a.is_empty());
                 chat_messages.push(ChatMessage {
                     role: role.to_string(),
                     content: content.to_string(),
+                    has_tool_calls,
                 });
             }
 

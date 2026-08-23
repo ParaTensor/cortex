@@ -146,12 +146,16 @@ impl TokenizerRegistry {
 
         // Slow path: Jinja Chat Template + Fast Tokenizer + Recursive Block Hashes
         let engine = self.tokenizers.get(model_id)?;
-        match engine.encode_chat_with_tools(messages, tools_json, true) {
-            Ok(tokens) => {
-                let page_hashes = compute_sglang_page_hashes(&tokens, page_size);
+        match engine.encode_chat_full(messages, tools_json, true) {
+            Ok(encoded) => {
+                let page_hashes = compute_sglang_page_hashes(&encoded.token_ids, page_size);
+                // M2: union special-token anchors with harness-declared block
+                // boundaries (turn starts / tool-call groups) so the survival
+                // factor tracks where agentic edits will actually cut.
+                let anchors = engine.page_is_anchor_chat(messages, &encoded, page_size);
                 let output = TokenizationOutput {
-                    page_is_anchor: Arc::new(engine.page_is_anchor(&tokens, page_size)),
-                    token_ids: Arc::new(tokens),
+                    page_is_anchor: Arc::new(anchors),
+                    token_ids: Arc::new(encoded.token_ids),
                     page_hashes: Arc::new(page_hashes),
                 };
                 let mut cache = self.cache.lock();
@@ -195,10 +199,12 @@ mod tests {
             ChatMessage {
                 role: "system".into(),
                 content: "You are an assistant".into(),
+                has_tool_calls: false,
             },
             ChatMessage {
                 role: "user".into(),
                 content: "Hi".into(),
+                has_tool_calls: false,
             },
         ];
         let c1 = TokenizerRegistry::compute_chat_cache_key("qwen", &chat_msgs, None, 16);

@@ -13,7 +13,7 @@ use tracing::{info, warn};
 use cortex::config::CortexConfig;
 use cortex::hasher::{TokenizerEngine, TokenizerRegistry};
 use cortex::ledger::{RadixHashTree, WorkerRuntimeState};
-use cortex::metrics::{health_live, health_ready};
+use cortex::metrics::{health_live, health_ready, RoutingStats};
 use cortex::proxy::{
     chat_completions_handler, cluster_status_handler, list_models_handler, session_close_handler,
     session_publish_handler, AppState,
@@ -150,6 +150,7 @@ async fn main() -> anyhow::Result<()> {
         workers,
         tokenizer_registry,
         sessions: Arc::new(SessionLedger::new()),
+        routing_stats: Arc::new(RoutingStats::default()),
         http_client: reqwest::Client::builder().build()?,
     };
 

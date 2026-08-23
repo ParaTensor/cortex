@@ -96,6 +96,7 @@ async fn test_axum_http_api_cluster_status_and_models() {
         workers,
         tokenizer_registry: Arc::new(TokenizerRegistry::new(100)),
         sessions: Arc::new(SessionLedger::new()),
+        routing_stats: Arc::new(cortex::metrics::RoutingStats::default()),
         http_client: reqwest::Client::new(),
     };
 

@@ -14,6 +14,7 @@ use tracing::{error, info, warn};
 use crate::config::CortexConfig;
 use crate::hasher::{ChatMessage, TokenizerRegistry};
 use crate::ledger::{RadixHashTree, WorkerRuntimeState};
+use crate::metrics::RoutingStats;
 use crate::scheduler::{LocalityScheduler, RoutingMode, SchedulingDecision};
 use crate::session_ledger::{SessionLedger, SessionPublishRequest};
 
@@ -29,6 +30,7 @@ pub struct AppState {
     pub workers: Arc<dashmap::DashMap<String, Arc<WorkerRuntimeState>>>,
     pub tokenizer_registry: Arc<TokenizerRegistry>,
     pub sessions: Arc<SessionLedger>,
+    pub routing_stats: Arc<RoutingStats>,
     pub http_client: reqwest::Client,
 }
 
@@ -119,6 +121,14 @@ pub async fn chat_completions_handler(
         state.sessions.record_assignment(session_id, epoch, &decision.worker_id);
     }
 
+    let mode_str = decision.mode.as_str();
+    state.routing_stats.record_mode(mode_str);
+    if decision.mode == RoutingMode::ExactKvEvents {
+        state
+            .routing_stats
+            .record_exact_hit(decision.matched_pages, decision.anchor_aligned);
+    }
+
     let worker = match state.workers.get(&decision.worker_id) {
         Some(w) => w.clone(),
         None => return Err(StatusCode::INTERNAL_SERVER_ERROR),
@@ -175,24 +185,79 @@ pub async fn chat_completions_handler(
         HeaderValue::from_static(if decision.anchor_aligned { "true" } else { "false" }),
     );
 
-    // Stream the body with automatic decrement on finish
-    let worker_guard = worker.clone();
-    let stream = upstream_res.bytes_stream().map(move |item| {
-        item.map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))
-    });
+    // Inject routing metadata into the response body for non-streaming JSON
+    // responses (unigateway-sdk's proxy_chat does not surface headers, so
+    // agents consume gateway telemetry from the body; zene issue #128).
+    // Streaming (SSE) responses keep header-only metadata: usage appears in
+    // the final chunk and rewriting SSE frames is not worth the complexity.
+    let is_json = upstream_res
+        .headers()
+        .get("content-type")
+        .and_then(|v| v.to_str().ok())
+        .is_some_and(|ct| ct.starts_with("application/json"));
 
-    let stream_with_cleanup = async_stream::stream! {
-        let _guard = scopeguard::guard(worker_guard, |w| {
-            w.dec_active_requests();
+    let worker_guard = worker.clone();
+    let body = if is_json {
+        // Body length changes after injection; drop the upstream length so
+        // hyper recomputes it.
+        response_headers.remove("content-length");
+        let bytes = match upstream_res.bytes().await {
+            Ok(b) => b,
+            Err(e) => {
+                error!(worker_id = %decision.worker_id, error = %e, "Failed to read upstream body");
+                worker.dec_active_requests();
+                return Err(StatusCode::BAD_GATEWAY);
+            }
+        };
+        // Nothing async remains: release the slot eagerly.
+        drop(worker_guard);
+        worker.dec_active_requests();
+
+        let mut payload: Value = match serde_json::from_slice(&bytes) {
+            Ok(v @ Value::Object(_)) => v,
+            _ => Value::Null,
+        };
+        if let Some(obj) = payload.as_object_mut() {
+            let hit_tokens = decision.matched_pages * page_size;
+            obj.insert(
+                "cortex".to_string(),
+                serde_json::json!({
+                    "assigned_worker": decision.worker_id,
+                    "match_mode": mode_str,
+                    "cache_hit_tokens": hit_tokens,
+                    "anchor_aligned": decision.anchor_aligned,
+                }),
+            );
+            if let Some(usage) = obj.get_mut("usage").and_then(|u| u.as_object_mut()) {
+                usage.insert("gateway_cache_hit_tokens".to_string(), serde_json::json!(hit_tokens));
+                usage.insert(
+                    "gateway_anchor_aligned".to_string(),
+                    serde_json::json!(decision.anchor_aligned),
+                );
+            }
+            Body::from(serde_json::to_vec(&payload).unwrap_or_else(|_| bytes.to_vec()))
+        } else {
+            Body::from(bytes)
+        }
+    } else {
+        // Stream the body with automatic decrement on finish
+        let stream = upstream_res.bytes_stream().map(move |item| {
+            item.map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))
         });
 
-        tokio::pin!(stream);
-        while let Some(chunk) = stream.next().await {
-            yield chunk;
-        }
-    };
+        let stream_with_cleanup = async_stream::stream! {
+            let _guard = scopeguard::guard(worker_guard, |w| {
+                w.dec_active_requests();
+            });
 
-    let body = Body::from_stream(stream_with_cleanup);
+            tokio::pin!(stream);
+            while let Some(chunk) = stream.next().await {
+                yield chunk;
+            }
+        };
+
+        Body::from_stream(stream_with_cleanup)
+    };
     let mut response = Response::new(body);
     *response.status_mut() = status;
     *response.headers_mut() = response_headers;
@@ -310,6 +375,8 @@ pub async fn cluster_status_handler(State(state): State<AppState>) -> impl IntoR
         "ready_workers": ready_count,
         "total_active_requests": total_active,
         "total_cached_blocks": total_blocks,
+        "total_sessions": state.sessions.total_sessions(),
+        "routing_stats": state.routing_stats.to_json(),
         "workers": worker_list,
     }))
 }

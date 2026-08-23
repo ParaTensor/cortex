@@ -22,12 +22,13 @@ env.update({
     "ZENE_PROVIDER": "openai",
     "ZENE_MODEL": MODEL,
     "ZENE_API_KEY": "sk-cortex-local",   # SGLang does not validate
-    "RUST_LOG": "zene=warn",
+    "RUST_LOG": "zene=debug",
 })
 
 proc = subprocess.Popen(
     ["/home/bodesi/zene/target/release/zene", "acp"],
-    stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
+    stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+    stderr=open("/tmp/zene_acp.err", "w"),
     env=env, cwd=WORKDIR, text=True, bufsize=1,
 )
 
@@ -122,3 +123,11 @@ stats, sessions = status_field()
 print(json.dumps(stats))
 print("total_sessions:", sessions)
 proc.terminate()
+print("\n== zene gateway telemetry logs ==")
+try:
+    with open("/tmp/zene_acp.err") as f:
+        for line in f:
+            if "gateway" in line.lower() or "anchor" in line.lower() or "cache hit" in line.lower():
+                print(line.rstrip())
+except FileNotFoundError:
+    print("(no stderr log)")

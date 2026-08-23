@@ -34,6 +34,74 @@ pub struct AppState {
     pub http_client: reqwest::Client,
 }
 
+
+/// Injects gateway routing telemetry into a JSON object in-place:
+/// top-level `cortex` plus `usage.gateway_*` mirrors (zene issue #128).
+fn inject_cortex_telemetry(
+    payload: &mut Value,
+    worker_id: &str,
+    mode: &str,
+    hit_tokens: usize,
+    anchor_aligned: bool,
+) {
+    let Some(obj) = payload.as_object_mut() else {
+        return;
+    };
+    obj.insert(
+        "cortex".to_string(),
+        serde_json::json!({
+            "assigned_worker": worker_id,
+            "match_mode": mode,
+            "cache_hit_tokens": hit_tokens,
+            "anchor_aligned": anchor_aligned,
+        }),
+    );
+    if let Some(usage) = obj.get_mut("usage").and_then(|u| u.as_object_mut()) {
+        usage.insert(
+            "gateway_cache_hit_tokens".to_string(),
+            serde_json::json!(hit_tokens),
+        );
+        // Alias consumed by unigateway-sdk's cache-hit normalizer.
+        usage.insert(
+            "cache_hit_tokens".to_string(),
+            serde_json::json!(hit_tokens),
+        );
+        usage.insert(
+            "gateway_anchor_aligned".to_string(),
+            serde_json::json!(anchor_aligned),
+        );
+    }
+}
+
+/// Rewrites a single SSE `data: {...}` line when it carries a `usage` object
+/// so streaming clients (zene's default path) receive the same telemetry as
+/// non-streaming JSON. Lines that are not JSON usage frames pass through.
+fn rewrite_sse_data_line(
+    line: &str,
+    worker_id: &str,
+    mode: &str,
+    hit_tokens: usize,
+    anchor_aligned: bool,
+) -> String {
+    let Some(payload) = line.strip_prefix("data: ") else {
+        return line.to_string();
+    };
+    if payload == "[DONE]" {
+        return line.to_string();
+    }
+    let Ok(mut value) = serde_json::from_str::<Value>(payload) else {
+        return line.to_string();
+    };
+    if !value.get("usage").map(|u| u.is_object()).unwrap_or(false) {
+        return line.to_string();
+    }
+    inject_cortex_telemetry(&mut value, worker_id, mode, hit_tokens, anchor_aligned);
+    match serde_json::to_string(&value) {
+        Ok(json) => format!("data: {json}"),
+        Err(_) => line.to_string(),
+    }
+}
+
 pub async fn chat_completions_handler(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -220,33 +288,31 @@ pub async fn chat_completions_handler(
             Ok(v @ Value::Object(_)) => v,
             _ => Value::Null,
         };
-        if let Some(obj) = payload.as_object_mut() {
+        if payload.is_object() {
             let hit_tokens = decision.matched_pages * page_size;
-            obj.insert(
-                "cortex".to_string(),
-                serde_json::json!({
-                    "assigned_worker": decision.worker_id,
-                    "match_mode": mode_str,
-                    "cache_hit_tokens": hit_tokens,
-                    "anchor_aligned": decision.anchor_aligned,
-                }),
+            inject_cortex_telemetry(
+                &mut payload,
+                &decision.worker_id,
+                mode_str,
+                hit_tokens,
+                decision.anchor_aligned,
             );
-            if let Some(usage) = obj.get_mut("usage").and_then(|u| u.as_object_mut()) {
-                usage.insert("gateway_cache_hit_tokens".to_string(), serde_json::json!(hit_tokens));
-                usage.insert(
-                    "gateway_anchor_aligned".to_string(),
-                    serde_json::json!(decision.anchor_aligned),
-                );
-            }
             Body::from(serde_json::to_vec(&payload).unwrap_or_else(|_| bytes.to_vec()))
         } else {
             Body::from(bytes)
         }
     } else {
-        // Stream the body with automatic decrement on finish
+        // Streaming (SSE): rewrite frames that carry a `usage` object so
+        // agents on the default streaming path still receive gateway
+        // telemetry (zene sets stream_options.include_usage).
+        response_headers.remove("content-length");
         let stream = upstream_res.bytes_stream().map(move |item| {
             item.map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))
         });
+        let worker_id = decision.worker_id.clone();
+        let mode = mode_str.to_string();
+        let hit_tokens = decision.matched_pages * page_size;
+        let aligned = decision.anchor_aligned;
 
         let stream_with_cleanup = async_stream::stream! {
             let _guard = scopeguard::guard(worker_guard, |w| {
@@ -254,8 +320,38 @@ pub async fn chat_completions_handler(
             });
 
             tokio::pin!(stream);
+            let mut leftover = Vec::<u8>::new();
             while let Some(chunk) = stream.next().await {
-                yield chunk;
+                match chunk {
+                    Ok(bytes) => {
+                        leftover.extend_from_slice(&bytes);
+                        while let Some(pos) = leftover.iter().position(|&b| b == b'\n') {
+                            let mut line_bytes: Vec<u8> = leftover.drain(..=pos).collect();
+                            if line_bytes.last() == Some(&b'\n') {
+                                line_bytes.pop();
+                            }
+                            if line_bytes.last() == Some(&b'\r') {
+                                line_bytes.pop();
+                            }
+                            let line = String::from_utf8_lossy(&line_bytes);
+                            let rewritten = rewrite_sse_data_line(
+                                &line, &worker_id, &mode, hit_tokens, aligned,
+                            );
+                            yield Ok(bytes::Bytes::from(format!("{rewritten}\n")));
+                        }
+                    }
+                    Err(e) => {
+                        yield Err(e);
+                        break;
+                    }
+                }
+            }
+            if !leftover.is_empty() {
+                let line = String::from_utf8_lossy(&leftover);
+                let rewritten = rewrite_sse_data_line(
+                    &line, &worker_id, &mode, hit_tokens, aligned,
+                );
+                yield Ok(bytes::Bytes::from(rewritten));
             }
         };
 

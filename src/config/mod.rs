@@ -86,6 +86,14 @@ pub struct SchedulerConfig {
     /// Threshold difference of active requests to trigger P2C or load-aware fallback
     #[serde(default = "default_enable_p2c")]
     pub enable_p2c: bool,
+    /// Semantic-anchor survival scoring (docs/semantic-anchor-routing.md).
+    /// When false, ranking is byte-identical to the legacy formula.
+    #[serde(default = "default_anchor_enabled", rename = "anchor_routing_enabled")]
+    pub anchor_routing_enabled: bool,
+    #[serde(default = "default_sigma_anchor")]
+    pub sigma_anchor: f64,
+    #[serde(default = "default_sigma_plain")]
+    pub sigma_plain: f64,
 }
 
 fn default_kv_weight() -> f64 {
@@ -104,6 +112,18 @@ fn default_enable_p2c() -> bool {
     true
 }
 
+fn default_anchor_enabled() -> bool {
+    true
+}
+
+fn default_sigma_anchor() -> f64 {
+    1.0
+}
+
+fn default_sigma_plain() -> f64 {
+    0.6
+}
+
 impl Default for SchedulerConfig {
     fn default() -> Self {
         Self {
@@ -111,6 +131,9 @@ impl Default for SchedulerConfig {
             load_weight: default_load_weight(),
             max_active_requests_per_worker: default_high_watermark(),
             enable_p2c: default_enable_p2c(),
+            anchor_routing_enabled: default_anchor_enabled(),
+            sigma_anchor: default_sigma_anchor(),
+            sigma_plain: default_sigma_plain(),
         }
     }
 }

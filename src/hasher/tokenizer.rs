@@ -1,3 +1,5 @@
+use std::collections::HashSet;
+
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 use tokenizers::Tokenizer;
@@ -21,6 +23,30 @@ pub struct ChatMessage {
 pub struct TokenizerEngine {
     tokenizer: Tokenizer,
     chat_template: Option<String>,
+    /// Vocab ids of structural special tokens whose positions mark semantic
+    /// block boundaries (turn ends, thinking ends, tool markers). Derived at
+    /// load time by scanning the vocab; see [`anchor_token_ids`].
+    anchor_token_ids: HashSet<u32>,
+}
+
+/// Built-in structural marker patterns used to seed the anchor set.
+/// Conservative on purpose: false positives dilute the survival signal,
+/// false negatives merely fall back to sigma_plain.
+const ANCHOR_TOKEN_PATTERNS: &[&str] = &[
+    "<|im_end|>", "</think>", "<|eot", "eot_id", "<tool_", "</tool",
+];
+
+fn anchor_token_ids_from_vocab(vocab: &std::collections::HashMap<String, u32>) -> HashSet<u32> {
+    vocab
+        .iter()
+        .filter(|(token, _)| {
+            let lower = token.to_lowercase();
+            ANCHOR_TOKEN_PATTERNS
+                .iter()
+                .any(|pattern| lower.contains(&pattern.to_lowercase()))
+        })
+        .map(|(_, id)| *id)
+        .collect()
 }
 
 impl TokenizerEngine {
@@ -28,9 +54,11 @@ impl TokenizerEngine {
     pub fn from_file(path: &str, chat_template: Option<String>) -> Result<Self, TokenizerError> {
         let tokenizer = Tokenizer::from_file(path)
             .map_err(|e| TokenizerError::LoadError(e.to_string()))?;
+        let anchor_token_ids = anchor_token_ids_from_vocab(&tokenizer.get_vocab(true));
         Ok(Self {
             tokenizer,
             chat_template,
+            anchor_token_ids,
         })
     }
 
@@ -38,9 +66,11 @@ impl TokenizerEngine {
     pub fn from_bytes(bytes: &[u8], chat_template: Option<String>) -> Result<Self, TokenizerError> {
         let tokenizer = Tokenizer::from_bytes(bytes)
             .map_err(|e| TokenizerError::LoadError(e.to_string()))?;
+        let anchor_token_ids = anchor_token_ids_from_vocab(&tokenizer.get_vocab(true));
         Ok(Self {
             tokenizer,
             chat_template,
+            anchor_token_ids,
         })
     }
 
@@ -51,6 +81,32 @@ impl TokenizerEngine {
             .encode(text, true)
             .map_err(|e| TokenizerError::EncodeError(e.to_string()))?;
         Ok(encoding.get_ids().to_vec())
+    }
+
+    /// Computes per-page anchor flags for a token stream (docs/semantic-anchor-routing.md).
+    ///
+    /// Page i is anchored when the stream passes a structural boundary token at
+    /// its very end, or immediately after it (trailing newline after `<|im_end|>`
+    /// etc.). Anchored page boundaries are the positions where agentic context
+    /// edits are likely to cut, so matches ending there survive later turns.
+    pub fn page_is_anchor(&self, token_ids: &[u32], page_size: usize) -> Vec<bool> {
+        let n = token_ids.len() / page_size;
+        let mut flags = Vec::with_capacity(n);
+        for i in 0..n {
+            let end = (i + 1) * page_size;
+            let last_here = token_ids[end - 1];
+            let just_after = token_ids.get(end).copied();
+            flags.push(
+                self.anchor_token_ids.contains(&last_here)
+                    || just_after.is_some_and(|t| self.anchor_token_ids.contains(&t)),
+            );
+        }
+        flags
+    }
+
+    /// Number of detected anchor token ids (diagnostics).
+    pub fn anchor_vocab_size(&self) -> usize {
+        self.anchor_token_ids.len()
     }
 
     /// Renders chat messages with Jinja2 template and tokenizes the rendered string.

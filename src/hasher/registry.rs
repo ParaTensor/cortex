@@ -13,6 +13,10 @@ use crate::hasher::tokenizer::{ChatMessage, TokenizerEngine};
 pub struct TokenizationOutput {
     pub token_ids: Arc<Vec<u32>>,
     pub page_hashes: Arc<Vec<i64>>,
+    /// Per-page semantic-anchor flags (docs/semantic-anchor-routing.md):
+    /// true when the page boundary coincides with a structural marker
+    /// (turn end / thinking end / tool marker).
+    pub page_is_anchor: Arc<Vec<bool>>,
 }
 
 pub struct TokenizerRegistry {
@@ -79,6 +83,7 @@ impl TokenizerRegistry {
             Ok(tokens) => {
                 let page_hashes = compute_sglang_page_hashes(&tokens, page_size);
                 let output = TokenizationOutput {
+                    page_is_anchor: Arc::new(engine.page_is_anchor(&tokens, page_size)),
                     token_ids: Arc::new(tokens),
                     page_hashes: Arc::new(page_hashes),
                 };
@@ -116,6 +121,7 @@ impl TokenizerRegistry {
             Ok(tokens) => {
                 let page_hashes = compute_sglang_page_hashes(&tokens, page_size);
                 let output = TokenizationOutput {
+                    page_is_anchor: Arc::new(engine.page_is_anchor(&tokens, page_size)),
                     token_ids: Arc::new(tokens),
                     page_hashes: Arc::new(page_hashes),
                 };

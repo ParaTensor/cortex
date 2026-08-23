@@ -32,6 +32,10 @@ pub struct SchedulingDecision {
     pub http_endpoint: String,
     pub matched_pages: usize,
     pub mode: RoutingMode,
+    /// True when an exact match's final page boundary coincides with a
+    /// semantic anchor (docs/semantic-anchor-routing.md). Always false for
+    /// non-exact modes.
+    pub anchor_aligned: bool,
 }
 
 pub struct LocalityScheduler {
@@ -56,10 +60,12 @@ impl LocalityScheduler {
     }
 
     /// Selects the best worker for a given request using the strict 4-tier scheduling fallback chain.
+    #[allow(clippy::too_many_arguments)]
     pub fn select_worker(
         &self,
         model_id: &str,
         page_hashes: &[i64],
+        page_is_anchor: &[bool],
         required_role: Option<WorkerRole>,
     ) -> Option<SchedulingDecision> {
         let role = required_role.unwrap_or(WorkerRole::Standard);
@@ -92,21 +98,38 @@ impl LocalityScheduler {
             let matches = self.tree.find_lcp_matches(page_hashes, &ready_worker_ids);
             if !matches.is_empty() {
                 let mut best_worker: Option<(Arc<WorkerRuntimeState>, usize, f64)> = None;
+                let mut best_anchor_aligned = false;
 
                 for worker in &eligible_workers {
                     if let Some(&matched) = matches.get(&worker.config.id) {
                         let active = worker.get_active_requests();
                         // Overload avoidance check: if worker is beyond high-watermark, skip KV affinity
                         if active < self.config.max_active_requests_per_worker {
-                            let score = (self.config.kv_weight * matched as f64)
+                            // Anchor survival factor: a match ending on a semantic block
+                            // boundary is likely to survive the next agentic context edit;
+                            // one ending mid-block likely collapses there instead.
+                            let (sigma, anchor_aligned) = if self.config.anchor_routing_enabled {
+                                let aligned = page_is_anchor
+                                    .get(matched.saturating_sub(1))
+                                    .copied()
+                                    .unwrap_or(false);
+                                (
+                                    if aligned {
+                                        self.config.sigma_anchor
+                                    } else {
+                                        self.config.sigma_plain
+                                    },
+                                    aligned,
+                                )
+                            } else {
+                                (1.0, false)
+                            };
+                            let score = (self.config.kv_weight * matched as f64 * sigma)
                                 - (self.config.load_weight * active as f64);
 
-                            if let Some((_, _, best_score)) = best_worker {
-                                if score > best_score {
-                                    best_worker = Some((worker.clone(), matched, score));
-                                }
-                            } else {
+                            if best_worker.is_none() || score > best_worker.as_ref().unwrap().2 {
                                 best_worker = Some((worker.clone(), matched, score));
+                                best_anchor_aligned = anchor_aligned;
                             }
                         }
                     }
@@ -118,6 +141,7 @@ impl LocalityScheduler {
                         http_endpoint: worker.config.http_endpoint.clone(),
                         matched_pages: matched,
                         mode: RoutingMode::ExactKvEvents,
+                        anchor_aligned: best_anchor_aligned,
                     });
                 }
             }
@@ -149,6 +173,7 @@ impl LocalityScheduler {
                 http_endpoint: chosen.config.http_endpoint.clone(),
                 matched_pages: 0,
                 mode: RoutingMode::FallbackP2c,
+                anchor_aligned: false,
             });
         }
 
@@ -172,6 +197,7 @@ impl LocalityScheduler {
                 http_endpoint: worker.config.http_endpoint.clone(),
                 matched_pages: 0,
                 mode: RoutingMode::LoadAware,
+                anchor_aligned: false,
             });
         }
 
@@ -186,6 +212,7 @@ impl LocalityScheduler {
             http_endpoint: fallback_worker.config.http_endpoint.clone(),
             matched_pages: 0,
             mode: RoutingMode::FallbackRoundRobin,
+            anchor_aligned: false,
         })
     }
 }
@@ -239,15 +266,75 @@ mod tests {
         tree.insert_chain("worker-1", &hashes);
 
         // Case 1: Exact KV match
-        let decision = scheduler.select_worker("test-model", &hashes, None).unwrap();
+        let decision = scheduler.select_worker("test-model", &hashes, &[false, false, false, false], None).unwrap();
         assert_eq!(decision.worker_id, "worker-1");
         assert_eq!(decision.mode, RoutingMode::ExactKvEvents);
         assert_eq!(decision.matched_pages, 3);
 
         // Case 2: No KV match -> P2C Fallback (with 2 workers and enable_p2c: true)
         let unseeded_hashes = vec![999];
-        let p2c_decision = scheduler.select_worker("test-model", &unseeded_hashes, None).unwrap();
+        let p2c_decision = scheduler.select_worker("test-model", &unseeded_hashes, &[], None).unwrap();
         assert_eq!(p2c_decision.mode, RoutingMode::FallbackP2c);
         assert_eq!(p2c_decision.matched_pages, 0);
+    }
+
+    /// docs/semantic-anchor-routing.md §4.3: a deeper match ending mid-block
+    /// (tool output interior) must LOSE to a shallower match ending exactly on
+    /// a semantic anchor boundary, because the latter survives the next
+    /// agentic context edit.
+    #[test]
+    fn test_anchor_survival_flips_ranking() {
+        // Shared chain: pages 11..44 common, then worker-deep has 55 (mid-block),
+        // worker-stable stops at the anchor-aligned page 44.
+        let tree = Arc::new(RadixHashTree::new());
+        let workers = Arc::new(DashMap::new());
+
+        let mk_cfg = |id: &str| WorkerConfig {
+            id: id.to_string(),
+            model: "test-model".to_string(),
+            engine: EngineType::Sglang,
+            http_endpoint: format!("http://127.0.0.1:80"),
+            zmq_endpoint: None,
+            tokenizer_path: None,
+            role: WorkerRole::Standard,
+            page_size: 16,
+            weight: 100,
+        };
+
+        let deep = Arc::new(WorkerRuntimeState::new(mk_cfg("worker-deep")));
+        let stable = Arc::new(WorkerRuntimeState::new(mk_cfg("worker-stable")));
+        deep.set_status(WorkerSyncStatus::Ready);
+        stable.set_status(WorkerSyncStatus::Ready);
+        workers.insert("worker-deep".to_string(), deep);
+        workers.insert("worker-stable".to_string(), stable);
+
+        tree.insert_chain("worker-deep", &[11, 22, 33, 55]);   // 4 pages, ends mid-block
+        tree.insert_chain("worker-stable", &[11, 22, 33]);     // 3 pages, ends on anchor
+
+        // Legacy ranking (anchor scoring off): depth wins -> worker-deep.
+        let legacy_cfg = SchedulerConfig {
+            anchor_routing_enabled: false,
+            ..SchedulerConfig::default()
+        };
+        let legacy = LocalityScheduler::new(legacy_cfg, tree.clone(), workers.clone());
+        let d = legacy
+            .select_worker("test-model", &[11, 22, 33, 55], &[false, false, false, false], None)
+            .unwrap();
+        assert_eq!(d.worker_id, "worker-deep");
+
+        // Anchor-aware ranking: sigma flips the winner to the anchor-aligned worker.
+        let scheduler = LocalityScheduler::new(SchedulerConfig::default(), tree.clone(), workers.clone());
+        let d = scheduler
+            .select_worker(
+                "test-model",
+                &[11, 22, 33, 55],
+                // query-side flags: page 3 is mid-block, page boundaries at index 2 is anchored
+                &[false, false, true, false],
+                None,
+            )
+            .unwrap();
+        assert_eq!(d.worker_id, "worker-stable");
+        assert_eq!(d.matched_pages, 3);
+        assert!(d.anchor_aligned);
     }
 }

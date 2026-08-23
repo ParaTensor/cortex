@@ -45,7 +45,7 @@ pub async fn chat_completions_handler(
     let page_size = 16;
 
     // 1. Tokenize messages or prompt with Fast Tokenizer & Zero-Allocation LRU Cache
-    let page_hashes: Arc<Vec<i64>> = if let Some(messages_val) = payload.get("messages").and_then(|m| m.as_array()) {
+    let (page_hashes, page_is_anchor): (Arc<Vec<i64>>, Arc<Vec<bool>>) = if let Some(messages_val) = payload.get("messages").and_then(|m| m.as_array()) {
         let mut chat_messages = Vec::with_capacity(messages_val.len());
         for msg in messages_val {
             let role = msg.get("role").and_then(|r| r.as_str()).unwrap_or("user");
@@ -59,20 +59,20 @@ pub async fn chat_completions_handler(
         state
             .tokenizer_registry
             .tokenize_and_hash_chat(model, &chat_messages, page_size)
-            .map(|out| out.page_hashes)
-            .unwrap_or_else(|| Arc::new(Vec::new()))
+            .map(|out| (out.page_hashes.clone(), out.page_is_anchor.clone()))
+            .unwrap_or_else(|| (Arc::new(Vec::new()), Arc::new(Vec::new())))
     } else if let Some(prompt) = payload.get("prompt").and_then(|p| p.as_str()) {
         state
             .tokenizer_registry
             .tokenize_and_hash_text(model, prompt, page_size)
-            .map(|out| out.page_hashes)
-            .unwrap_or_else(|| Arc::new(Vec::new()))
+            .map(|out| (out.page_hashes.clone(), out.page_is_anchor.clone()))
+            .unwrap_or_else(|| (Arc::new(Vec::new()), Arc::new(Vec::new())))
     } else {
-        Arc::new(Vec::new())
+        (Arc::new(Vec::new()), Arc::new(Vec::new()))
     };
 
     // 2. Schedule request using 4-tier fallback
-    let mut decision = match state.scheduler.select_worker(model, &page_hashes, None) {
+    let mut decision = match state.scheduler.select_worker(model, &page_hashes, &page_is_anchor, None) {
         Some(d) => d,
         None => {
             warn!(model = %model, "No available worker found for request");
@@ -110,6 +110,7 @@ pub async fn chat_completions_handler(
                             http_endpoint: w.config.http_endpoint.clone(),
                             matched_pages: 0,
                             mode: RoutingMode::SessionAffinity,
+                            anchor_aligned: false,
                         };
                     }
                 }
@@ -168,6 +169,10 @@ pub async fn chat_completions_handler(
         "x-cortex-cache-hit-tokens",
         HeaderValue::from_str(&(decision.matched_pages * page_size).to_string())
             .unwrap_or(HeaderValue::from_static("0")),
+    );
+    response_headers.insert(
+        "x-cortex-anchor-aligned",
+        HeaderValue::from_static(if decision.anchor_aligned { "true" } else { "false" }),
     );
 
     // Stream the body with automatic decrement on finish

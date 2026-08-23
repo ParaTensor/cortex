@@ -1,5 +1,5 @@
-use std::sync::Arc;
 use dashmap::DashMap;
+use std::sync::Arc;
 
 use cortex::config::{EngineType, SchedulerConfig, WorkerConfig, WorkerRole};
 use cortex::hasher::compute_sglang_page_hashes;
@@ -42,7 +42,8 @@ async fn test_end_to_end_zmq_event_to_exact_kv_routing() {
     workers.insert("sgl-gpu-02".to_string(), w2.clone());
 
     let processor = Arc::new(KvEventProcessor::new(tree.clone()));
-    let scheduler = LocalityScheduler::new(SchedulerConfig::default(), tree.clone(), workers.clone());
+    let scheduler =
+        LocalityScheduler::new(SchedulerConfig::default(), tree.clone(), workers.clone());
 
     // 1. Initial State: Workers are in INIT status, no KV in Radix tree
     let tokens: Vec<u32> = (100..164).collect();
@@ -51,7 +52,7 @@ async fn test_end_to_end_zmq_event_to_exact_kv_routing() {
 
     // Initial query should fallback to P2C / load-aware because workers are not READY
     let init_decision = scheduler
-        .select_worker("meta-llama/Llama-3.1-8B-Instruct", &page_hashes, None)
+        .select_worker("meta-llama/Llama-3.1-8B-Instruct", &page_hashes, &[], None)
         .unwrap();
     assert_eq!(init_decision.mode, RoutingMode::FallbackP2c);
     assert_eq!(init_decision.matched_pages, 0);
@@ -70,7 +71,7 @@ async fn test_end_to_end_zmq_event_to_exact_kv_routing() {
 
     // 3. Query again: should match 4 pages on sgl-gpu-01 with exact_kv_events
     let matched_decision = scheduler
-        .select_worker("meta-llama/Llama-3.1-8B-Instruct", &page_hashes, None)
+        .select_worker("meta-llama/Llama-3.1-8B-Instruct", &page_hashes, &[], None)
         .unwrap();
     assert_eq!(matched_decision.worker_id, "sgl-gpu-01");
     assert_eq!(matched_decision.mode, RoutingMode::ExactKvEvents);
@@ -87,7 +88,7 @@ async fn test_end_to_end_zmq_event_to_exact_kv_routing() {
 
     // 5. Query after eviction: should miss and cleanly fallback
     let after_evict_decision = scheduler
-        .select_worker("meta-llama/Llama-3.1-8B-Instruct", &page_hashes, None)
+        .select_worker("meta-llama/Llama-3.1-8B-Instruct", &page_hashes, &[], None)
         .unwrap();
     assert_eq!(after_evict_decision.matched_pages, 0);
     assert_eq!(after_evict_decision.mode, RoutingMode::FallbackP2c);

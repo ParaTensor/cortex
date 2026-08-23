@@ -1,19 +1,22 @@
-use std::sync::Arc;
 use axum::{
+    Router,
     body::Body,
     http::{Request, StatusCode},
     routing::{get, post},
-    Router,
 };
 use dashmap::DashMap;
 use http_body_util::BodyExt;
+use std::sync::Arc;
 use tower::ServiceExt;
 
 use cortex::config::{CortexConfig, EngineType, SchedulerConfig, WorkerConfig, WorkerRole};
 use cortex::hasher::TokenizerRegistry;
 use cortex::ledger::{RadixHashTree, WorkerRuntimeState, WorkerSyncStatus};
-use cortex::proxy::{chat_completions_handler, cluster_status_handler, list_models_handler, AppState};
+use cortex::proxy::{
+    AppState, chat_completions_handler, cluster_status_handler, list_models_handler,
+};
 use cortex::scheduler::LocalityScheduler;
+use cortex::session_ledger::SessionLedger;
 use cortex::zmq::KvEventProcessor;
 
 #[tokio::test]
@@ -37,7 +40,8 @@ async fn test_sglang_msgpack_event_processing_and_lru_removal() {
     // 1. SGLang msgspec msgpack wire representation for BlockStored:
     // [1.0, [["BlockStored", [1001, 1002, 1003], None, [1, 2, 3], 16, None, None]], 0]
     let seq1_bytes = 1u64.to_be_bytes();
-    let stored_payload_hex = "93cb3ff00000000000009197ab426c6f636b53746f72656493cd03e9cd03eacd03ebc09301020310c0c000";
+    let stored_payload_hex =
+        "93cb3ff00000000000009197ab426c6f636b53746f72656493cd03e9cd03eacd03ebc09301020310c0c000";
     let stored_payload_bytes = hex::decode(stored_payload_hex).unwrap();
 
     let events1 = KvEventProcessor::parse_sglang_multipart(&seq1_bytes, &stored_payload_bytes);
@@ -94,6 +98,8 @@ async fn test_axum_http_api_cluster_status_and_models() {
         tree,
         workers,
         tokenizer_registry: Arc::new(TokenizerRegistry::new(100)),
+        sessions: Arc::new(SessionLedger::new()),
+        routing_stats: Arc::new(cortex::metrics::RoutingStats::default()),
         http_client: reqwest::Client::new(),
     };
 

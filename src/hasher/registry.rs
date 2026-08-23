@@ -1,8 +1,8 @@
-use std::num::NonZeroUsize;
-use std::sync::Arc;
 use dashmap::DashMap;
 use parking_lot::Mutex;
 use sha2::{Digest, Sha256};
+use std::num::NonZeroUsize;
+use std::sync::Arc;
 use tracing::warn;
 
 use crate::hasher::sglang::compute_sglang_page_hashes;
@@ -13,6 +13,10 @@ use crate::hasher::tokenizer::{ChatMessage, TokenizerEngine};
 pub struct TokenizationOutput {
     pub token_ids: Arc<Vec<u32>>,
     pub page_hashes: Arc<Vec<i64>>,
+    /// Per-page semantic-anchor flags (docs/semantic-anchor-routing.md):
+    /// true when the page boundary coincides with a structural marker
+    /// (turn end / thinking end / tool marker).
+    pub page_is_anchor: Arc<Vec<bool>>,
 }
 
 pub struct TokenizerRegistry {
@@ -48,7 +52,12 @@ impl TokenizerRegistry {
     }
 
     /// Computes direct 32-byte cache key digest for chat messages without JSON serialization.
-    pub fn compute_chat_cache_key(model_id: &str, messages: &[ChatMessage], page_size: usize) -> [u8; 32] {
+    pub fn compute_chat_cache_key(
+        model_id: &str,
+        messages: &[ChatMessage],
+        tools_json: Option<&str>,
+        page_size: usize,
+    ) -> [u8; 32] {
         let mut hasher = Sha256::new();
         hasher.update(model_id.as_bytes());
         hasher.update(page_size.to_le_bytes());
@@ -58,11 +67,20 @@ impl TokenizerRegistry {
             hasher.update(msg.content.as_bytes());
             hasher.update([1u8]);
         }
+        if let Some(tools) = tools_json {
+            hasher.update([2u8]);
+            hasher.update(tools.as_bytes());
+        }
         hasher.finalize().into()
     }
 
     /// Tokenizes raw text and returns precomputed block hashes with zero-copy LRU caching.
-    pub fn tokenize_and_hash_text(&self, model_id: &str, text: &str, page_size: usize) -> Option<TokenizationOutput> {
+    pub fn tokenize_and_hash_text(
+        &self,
+        model_id: &str,
+        text: &str,
+        page_size: usize,
+    ) -> Option<TokenizationOutput> {
         let cache_key = Self::compute_text_cache_key(model_id, text, page_size);
 
         // Fast path: L1/L2 LRU Cache Hit (< 1µs)
@@ -79,6 +97,7 @@ impl TokenizerRegistry {
             Ok(tokens) => {
                 let page_hashes = compute_sglang_page_hashes(&tokens, page_size);
                 let output = TokenizationOutput {
+                    page_is_anchor: Arc::new(engine.page_is_anchor(&tokens, page_size)),
                     token_ids: Arc::new(tokens),
                     page_hashes: Arc::new(page_hashes),
                 };
@@ -100,7 +119,22 @@ impl TokenizerRegistry {
         messages: &[ChatMessage],
         page_size: usize,
     ) -> Option<TokenizationOutput> {
-        let cache_key = Self::compute_chat_cache_key(model_id, messages, page_size);
+        self.tokenize_and_hash_chat_with_tools(model_id, messages, None, page_size)
+    }
+
+    /// Chat variant that incorporates the request's tool schema into rendering
+    /// and cache identity — required for byte-identical hashes with engine-side
+    /// template rendering when agents attach tools.
+    pub fn tokenize_and_hash_chat_with_tools(
+        &self,
+        model_id: &str,
+        messages: &[ChatMessage],
+        tools_json: Option<&serde_json::Value>,
+        page_size: usize,
+    ) -> Option<TokenizationOutput> {
+        let tools_str = tools_json.map(|t| t.to_string());
+        let cache_key =
+            Self::compute_chat_cache_key(model_id, messages, tools_str.as_deref(), page_size);
 
         // Fast path: L1/L2 LRU Cache Hit (< 1µs)
         {
@@ -112,10 +146,11 @@ impl TokenizerRegistry {
 
         // Slow path: Jinja Chat Template + Fast Tokenizer + Recursive Block Hashes
         let engine = self.tokenizers.get(model_id)?;
-        match engine.encode_chat(messages, true) {
+        match engine.encode_chat_with_tools(messages, tools_json, true) {
             Ok(tokens) => {
                 let page_hashes = compute_sglang_page_hashes(&tokens, page_size);
                 let output = TokenizationOutput {
+                    page_is_anchor: Arc::new(engine.page_is_anchor(&tokens, page_size)),
                     token_ids: Arc::new(tokens),
                     page_hashes: Arc::new(page_hashes),
                 };
@@ -157,11 +192,30 @@ mod tests {
         assert_ne!(k1, k3);
 
         let chat_msgs = vec![
-            ChatMessage { role: "system".into(), content: "You are an assistant".into() },
-            ChatMessage { role: "user".into(), content: "Hi".into() },
+            ChatMessage {
+                role: "system".into(),
+                content: "You are an assistant".into(),
+            },
+            ChatMessage {
+                role: "user".into(),
+                content: "Hi".into(),
+            },
         ];
-        let c1 = TokenizerRegistry::compute_chat_cache_key("qwen", &chat_msgs, 16);
-        let c2 = TokenizerRegistry::compute_chat_cache_key("qwen", &chat_msgs, 16);
+        let c1 = TokenizerRegistry::compute_chat_cache_key("qwen", &chat_msgs, None, 16);
+        let c2 = TokenizerRegistry::compute_chat_cache_key("qwen", &chat_msgs, None, 16);
         assert_eq!(c1, c2);
+
+        // Tool schema participates in cache identity: same messages but a
+        // different tools definition must produce a distinct key.
+        let tools_a = Some(r#"[{"type":"function","name":"read_file"}]"#);
+        let tools_b = Some(r#"[{"type":"function","name":"write_file"}]"#);
+        assert_ne!(
+            TokenizerRegistry::compute_chat_cache_key("qwen", &chat_msgs, tools_a, 16),
+            TokenizerRegistry::compute_chat_cache_key("qwen", &chat_msgs, tools_b, 16)
+        );
+        assert_eq!(
+            TokenizerRegistry::compute_chat_cache_key("qwen", &chat_msgs, tools_a, 16),
+            TokenizerRegistry::compute_chat_cache_key("qwen", &chat_msgs, tools_a, 16)
+        );
     }
 }

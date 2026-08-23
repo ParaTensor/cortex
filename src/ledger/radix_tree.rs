@@ -1,5 +1,5 @@
-use std::collections::{HashMap, HashSet};
 use dashmap::DashMap;
+use std::collections::{HashMap, HashSet};
 
 /// KV-Cache locality ledger.
 ///
@@ -40,7 +40,8 @@ impl RadixHashTree {
                 entry.remove(worker_id);
                 if entry.is_empty() {
                     drop(entry);
-                    self.blocks.remove_if(&hash, |_, holders| holders.is_empty());
+                    self.blocks
+                        .remove_if(&hash, |_, holders| holders.is_empty());
                 }
             }
         }
@@ -59,7 +60,8 @@ impl RadixHashTree {
                 entry.remove(worker_id);
                 if entry.is_empty() {
                     drop(entry);
-                    self.blocks.remove_if(&hash, |_, holders| holders.is_empty());
+                    self.blocks
+                        .remove_if(&hash, |_, holders| holders.is_empty());
                 }
             }
         }
@@ -81,7 +83,9 @@ impl RadixHashTree {
         // membership of consecutive prefixes implies a contiguous cached path.
         let mut alive: Vec<&String> = eligible_workers.iter().collect();
         for (depth, &hash) in page_hashes.iter().enumerate() {
-            let Some(holders) = self.blocks.get(&hash) else { break };
+            let Some(holders) = self.blocks.get(&hash) else {
+                break;
+            };
             alive.retain(|worker| holders.contains(*worker));
             if alive.is_empty() {
                 break;

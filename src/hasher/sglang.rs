@@ -30,7 +30,8 @@ pub fn compute_sglang_page_hashes(token_ids: &[u32], page_size: usize) -> Vec<i6
 
         let digest: [u8; 32] = hasher.finalize().into();
         // First 8 bytes converted to signed i64 in big-endian (SGLang standard radix page hash representation)
-        let hash_i64 = i64::from_be_bytes(digest[0..8].try_into().expect("slice with exact length"));
+        let hash_i64 =
+            i64::from_be_bytes(digest[0..8].try_into().expect("slice with exact length"));
         page_hashes.push(hash_i64);
         prev_digest = Some(digest);
     }

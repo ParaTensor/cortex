@@ -1,6 +1,6 @@
+use crate::config::WorkerConfig;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Instant;
-use crate::config::WorkerConfig;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum WorkerSyncStatus {

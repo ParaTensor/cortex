@@ -13,7 +13,7 @@ use tracing::{error, info, warn};
 
 use crate::config::CortexConfig;
 use crate::hasher::{ChatMessage, TokenizerRegistry};
-use crate::ledger::{RadixHashTree, WorkerRuntimeState};
+use crate::ledger::{RadixHashTree, WorkerRuntimeState, WorkerSyncStatus};
 use crate::metrics::RoutingStats;
 use crate::scheduler::{LocalityScheduler, RoutingMode, SchedulingDecision};
 use crate::session_ledger::{SessionLedger, SessionPublishRequest};
@@ -242,6 +242,23 @@ pub async fn chat_completions_handler(
     };
 
     let status = StatusCode::from_u16(upstream_res.status().as_u16()).unwrap_or(StatusCode::OK);
+
+    // Write-through: the engine just prefills this prefix on the assigned
+    // worker. Insert the hashes we already computed so the next identical
+    // request exact-matches immediately — without waiting for ZMQ flush
+    // (idle-only on some SGLang loops) and without depending on the engine
+    // re-emitting already-cached blocks after a gateway restart.
+    // ZMQ BlockRemoved remains the eviction authority.
+    if status.is_success() && !page_hashes.is_empty() {
+        state.tree.insert_chain(&decision.worker_id, &page_hashes);
+        if let Some(w) = state.workers.get(&decision.worker_id) {
+            let st = *w.status.read();
+            if st == WorkerSyncStatus::Syncing || st == WorkerSyncStatus::Init {
+                w.set_status(WorkerSyncStatus::Ready);
+            }
+        }
+    }
+
     let mut response_headers = HeaderMap::new();
 
     for (k, v) in upstream_res.headers() {

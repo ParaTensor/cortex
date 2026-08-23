@@ -58,9 +58,12 @@ pub async fn chat_completions_handler(
             });
         }
 
+        // Tool schema participates in engine-side template rendering; hashes
+        // must be computed over the same stream or exact matching breaks.
+        let tools_val = payload.get("tools").filter(|t| t.is_array());
         state
             .tokenizer_registry
-            .tokenize_and_hash_chat(model, &chat_messages, page_size)
+            .tokenize_and_hash_chat_with_tools(model, &chat_messages, tools_val, page_size)
             .map(|out| (out.page_hashes.clone(), out.page_is_anchor.clone()))
             .unwrap_or_else(|| (Arc::new(Vec::new()), Arc::new(Vec::new())))
     } else if let Some(prompt) = payload.get("prompt").and_then(|p| p.as_str()) {

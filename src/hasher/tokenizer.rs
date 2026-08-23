@@ -115,6 +115,22 @@ impl TokenizerEngine {
         messages: &[ChatMessage],
         add_generation_prompt: bool,
     ) -> Result<Vec<u32>, TokenizerError> {
+        self.encode_chat_with_tools(messages, None, add_generation_prompt)
+    }
+
+    /// Renders + tokenizes with an optional `tools` definition.
+    ///
+    /// Alignment contract (docs/tokenizer-hash-alignment.md): engines render
+    /// the chat template with the request's tool schema included, so the
+    /// gateway MUST hash the same rendered stream. Coding agents (zene) always
+    /// attach tools; omitting them here would desynchronize page hashes from
+    /// the very first block and permanently disable exact KV matching.
+    pub fn encode_chat_with_tools(
+        &self,
+        messages: &[ChatMessage],
+        tools: Option<&serde_json::Value>,
+        add_generation_prompt: bool,
+    ) -> Result<Vec<u32>, TokenizerError> {
         if let Some(template_str) = &self.chat_template {
             let mut env = minijinja::Environment::new();
             env.add_template("chat_template", template_str)
@@ -124,9 +140,14 @@ impl TokenizerEngine {
                 .get_template("chat_template")
                 .map_err(|e| TokenizerError::TemplateError(e.to_string()))?;
 
+            let tools_value = match tools {
+                Some(t) => minijinja::Value::from_serialize(t),
+                None => minijinja::Value::UNDEFINED,
+            };
             let context = minijinja::context! {
                 messages => messages,
                 add_generation_prompt => add_generation_prompt,
+                tools => tools_value,
             };
 
             let rendered = template

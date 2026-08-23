@@ -1,8 +1,8 @@
-use std::num::NonZeroUsize;
-use std::sync::Arc;
 use dashmap::DashMap;
 use parking_lot::Mutex;
 use sha2::{Digest, Sha256};
+use std::num::NonZeroUsize;
+use std::sync::Arc;
 use tracing::warn;
 
 use crate::hasher::sglang::compute_sglang_page_hashes;
@@ -75,7 +75,12 @@ impl TokenizerRegistry {
     }
 
     /// Tokenizes raw text and returns precomputed block hashes with zero-copy LRU caching.
-    pub fn tokenize_and_hash_text(&self, model_id: &str, text: &str, page_size: usize) -> Option<TokenizationOutput> {
+    pub fn tokenize_and_hash_text(
+        &self,
+        model_id: &str,
+        text: &str,
+        page_size: usize,
+    ) -> Option<TokenizationOutput> {
         let cache_key = Self::compute_text_cache_key(model_id, text, page_size);
 
         // Fast path: L1/L2 LRU Cache Hit (< 1µs)
@@ -187,8 +192,14 @@ mod tests {
         assert_ne!(k1, k3);
 
         let chat_msgs = vec![
-            ChatMessage { role: "system".into(), content: "You are an assistant".into() },
-            ChatMessage { role: "user".into(), content: "Hi".into() },
+            ChatMessage {
+                role: "system".into(),
+                content: "You are an assistant".into(),
+            },
+            ChatMessage {
+                role: "user".into(),
+                content: "Hi".into(),
+            },
         ];
         let c1 = TokenizerRegistry::compute_chat_cache_key("qwen", &chat_msgs, None, 16);
         let c2 = TokenizerRegistry::compute_chat_cache_key("qwen", &chat_msgs, None, 16);

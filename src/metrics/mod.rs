@@ -2,7 +2,7 @@ mod routing_stats;
 
 pub use routing_stats::RoutingStats;
 
-use axum::{http::StatusCode, response::IntoResponse, Json};
+use axum::{Json, http::StatusCode, response::IntoResponse};
 use serde_json::json;
 
 pub async fn health_live() -> impl IntoResponse {

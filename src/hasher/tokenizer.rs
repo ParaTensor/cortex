@@ -33,7 +33,12 @@ pub struct TokenizerEngine {
 /// Conservative on purpose: false positives dilute the survival signal,
 /// false negatives merely fall back to sigma_plain.
 const ANCHOR_TOKEN_PATTERNS: &[&str] = &[
-    "<|im_end|>", "</think>", "<|eot", "eot_id", "<tool_", "</tool",
+    "<|im_end|>",
+    "</think>",
+    "<|eot",
+    "eot_id",
+    "<tool_",
+    "</tool",
 ];
 
 fn anchor_token_ids_from_vocab(vocab: &std::collections::HashMap<String, u32>) -> HashSet<u32> {
@@ -52,8 +57,8 @@ fn anchor_token_ids_from_vocab(vocab: &std::collections::HashMap<String, u32>) -
 impl TokenizerEngine {
     /// Loads a tokenizer from a local `tokenizer.json` file.
     pub fn from_file(path: &str, chat_template: Option<String>) -> Result<Self, TokenizerError> {
-        let tokenizer = Tokenizer::from_file(path)
-            .map_err(|e| TokenizerError::LoadError(e.to_string()))?;
+        let tokenizer =
+            Tokenizer::from_file(path).map_err(|e| TokenizerError::LoadError(e.to_string()))?;
         let anchor_token_ids = anchor_token_ids_from_vocab(&tokenizer.get_vocab(true));
         Ok(Self {
             tokenizer,
@@ -64,8 +69,8 @@ impl TokenizerEngine {
 
     /// Creates a TokenizerEngine from an in-memory byte buffer.
     pub fn from_bytes(bytes: &[u8], chat_template: Option<String>) -> Result<Self, TokenizerError> {
-        let tokenizer = Tokenizer::from_bytes(bytes)
-            .map_err(|e| TokenizerError::LoadError(e.to_string()))?;
+        let tokenizer =
+            Tokenizer::from_bytes(bytes).map_err(|e| TokenizerError::LoadError(e.to_string()))?;
         let anchor_token_ids = anchor_token_ids_from_vocab(&tokenizer.get_vocab(true));
         Ok(Self {
             tokenizer,

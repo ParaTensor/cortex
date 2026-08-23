@@ -1,11 +1,11 @@
-use std::net::SocketAddr;
-use std::sync::Arc;
 use axum::{
-    routing::{delete, get, post},
     Router,
+    routing::{delete, get, post},
 };
 use clap::Parser;
 use dashmap::DashMap;
+use std::net::SocketAddr;
+use std::sync::Arc;
 use tower_http::cors::CorsLayer;
 use tower_http::trace::TraceLayer;
 use tracing::{info, warn};
@@ -13,13 +13,13 @@ use tracing::{info, warn};
 use cortex::config::CortexConfig;
 use cortex::hasher::{TokenizerEngine, TokenizerRegistry};
 use cortex::ledger::{RadixHashTree, WorkerRuntimeState};
-use cortex::metrics::{health_live, health_ready, RoutingStats};
+use cortex::metrics::{RoutingStats, health_live, health_ready};
 use cortex::proxy::{
-    chat_completions_handler, cluster_status_handler, list_models_handler, session_close_handler,
-    session_publish_handler, AppState,
+    AppState, chat_completions_handler, cluster_status_handler, list_models_handler,
+    session_close_handler, session_publish_handler,
 };
-use cortex::session_ledger::SessionLedger;
 use cortex::scheduler::LocalityScheduler;
+use cortex::session_ledger::SessionLedger;
 
 /// Resolves the effective chat template for a tokenizer path.
 ///
@@ -45,7 +45,10 @@ fn resolve_chat_template(tok_path: &str, configured: Option<String>) -> Option<S
 }
 
 #[derive(Parser, Debug)]
-#[command(name = "cortex", about = "High-performance cluster KV-Cache aware & PD disaggregation inference gateway")]
+#[command(
+    name = "cortex",
+    about = "High-performance cluster KV-Cache aware & PD disaggregation inference gateway"
+)]
 struct Args {
     #[arg(short, long, default_value = "cortex.yaml")]
     config: String,
@@ -76,7 +79,10 @@ async fn main() -> anyhow::Result<()> {
         let content = std::fs::read_to_string(&args.config)?;
         serde_yaml::from_str::<CortexConfig>(&content)?
     } else {
-        info!("Config file '{}' not found, using default configuration", args.config);
+        info!(
+            "Config file '{}' not found, using default configuration",
+            args.config
+        );
         CortexConfig {
             host: args.host,
             port: args.port,
@@ -108,8 +114,7 @@ async fn main() -> anyhow::Result<()> {
 
     for model_cfg in &config.models {
         if let Some(tok_path) = &model_cfg.tokenizer_path {
-            let chat_template =
-                resolve_chat_template(tok_path, model_cfg.chat_template.clone());
+            let chat_template = resolve_chat_template(tok_path, model_cfg.chat_template.clone());
             if model_cfg.chat_template.is_none() && chat_template.is_some() {
                 info!(model_id = %model_cfg.model_id, "Discovered chat template from tokenizer_config.json");
             }
@@ -165,7 +170,10 @@ async fn main() -> anyhow::Result<()> {
             "/v1/zene/sessions/{session_id}/publish",
             post(session_publish_handler),
         )
-        .route("/v1/zene/sessions/{session_id}", delete(session_close_handler))
+        .route(
+            "/v1/zene/sessions/{session_id}",
+            delete(session_close_handler),
+        )
         // OpenAI-compatible endpoints
         .route("/v1/models", get(list_models_handler))
         .route("/v1/chat/completions", post(chat_completions_handler))

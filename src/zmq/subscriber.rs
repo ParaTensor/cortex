@@ -1,7 +1,7 @@
-use std::sync::Arc;
-use std::time::Duration;
 use dashmap::DashMap;
 use serde::{Deserialize, Serialize};
+use std::sync::Arc;
+use std::time::Duration;
 use tokio::time::sleep;
 use tracing::{error, info, warn};
 use zeromq::{Socket, SocketRecv, SubSocket};
@@ -10,12 +10,8 @@ use crate::ledger::{RadixHashTree, WorkerRuntimeState, WorkerSyncStatus};
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum KvEventPayload {
-    BlockStored {
-        page_hashes: Vec<i64>,
-    },
-    BlockRemoved {
-        page_hashes: Vec<i64>,
-    },
+    BlockStored { page_hashes: Vec<i64> },
+    BlockRemoved { page_hashes: Vec<i64> },
     AllBlocksCleared,
 }
 
@@ -59,7 +55,8 @@ impl KvEventProcessor {
                                 if let Some(rmpv::Value::String(ev_name)) = ev_fields.first() {
                                     let name_str = ev_name.as_str().unwrap_or("");
                                     if name_str == "BlockStored" {
-                                        if let Some(rmpv::Value::Array(hash_arr)) = ev_fields.get(1) {
+                                        if let Some(rmpv::Value::Array(hash_arr)) = ev_fields.get(1)
+                                        {
                                             let mut hashes = Vec::with_capacity(hash_arr.len());
                                             for h in hash_arr {
                                                 if let Some(val) = h.as_i64() {
@@ -70,11 +67,14 @@ impl KvEventProcessor {
                                             }
                                             results.push(KvEventMessage {
                                                 seq,
-                                                payload: KvEventPayload::BlockStored { page_hashes: hashes },
+                                                payload: KvEventPayload::BlockStored {
+                                                    page_hashes: hashes,
+                                                },
                                             });
                                         }
                                     } else if name_str == "BlockRemoved" {
-                                        if let Some(rmpv::Value::Array(hash_arr)) = ev_fields.get(1) {
+                                        if let Some(rmpv::Value::Array(hash_arr)) = ev_fields.get(1)
+                                        {
                                             let mut hashes = Vec::with_capacity(hash_arr.len());
                                             for h in hash_arr {
                                                 if let Some(val) = h.as_i64() {
@@ -85,7 +85,9 @@ impl KvEventProcessor {
                                             }
                                             results.push(KvEventMessage {
                                                 seq,
-                                                payload: KvEventPayload::BlockRemoved { page_hashes: hashes },
+                                                payload: KvEventPayload::BlockRemoved {
+                                                    page_hashes: hashes,
+                                                },
                                             });
                                         }
                                     } else if name_str == "AllBlocksCleared" {
@@ -117,12 +119,19 @@ impl KvEventProcessor {
             if let Ok(json_ev) = serde_json::from_slice::<JsonEventWrapper>(payload_bytes) {
                 let actual_seq = if seq > 0 { seq } else { json_ev.seq };
                 let payload = match json_ev.event_type.as_str() {
-                    "block_stored" | "BlockStored" => KvEventPayload::BlockStored { page_hashes: json_ev.page_hashes },
-                    "block_removed" | "BlockRemoved" => KvEventPayload::BlockRemoved { page_hashes: json_ev.page_hashes },
+                    "block_stored" | "BlockStored" => KvEventPayload::BlockStored {
+                        page_hashes: json_ev.page_hashes,
+                    },
+                    "block_removed" | "BlockRemoved" => KvEventPayload::BlockRemoved {
+                        page_hashes: json_ev.page_hashes,
+                    },
                     "all_blocks_cleared" | "AllBlocksCleared" => KvEventPayload::AllBlocksCleared,
                     _ => KvEventPayload::AllBlocksCleared,
                 };
-                results.push(KvEventMessage { seq: actual_seq, payload });
+                results.push(KvEventMessage {
+                    seq: actual_seq,
+                    payload,
+                });
             }
         }
 
@@ -183,7 +192,9 @@ impl KvEventProcessor {
                 }
 
                 self.tree.insert_chain(&worker.config.id, &page_hashes);
-                if current_status == WorkerSyncStatus::Syncing || current_status == WorkerSyncStatus::Init {
+                if current_status == WorkerSyncStatus::Syncing
+                    || current_status == WorkerSyncStatus::Init
+                {
                     info!(worker_id = %worker.config.id, "Worker synchronized. Transitioning to READY.");
                     worker.set_status(WorkerSyncStatus::Ready);
                 }
@@ -239,7 +250,8 @@ pub fn spawn_worker_zmq_subscriber(
                     // when the stream stays silent, forcing a fresh TCP connect;
                     // ledger integrity across restarts is arbitrated by seq.
                     loop {
-                        let recv = tokio::time::timeout(Duration::from_secs(30), socket.recv()).await;
+                        let recv =
+                            tokio::time::timeout(Duration::from_secs(30), socket.recv()).await;
                         let msg = match recv {
                             Ok(Ok(msg)) => msg,
                             Ok(Err(e)) => {
@@ -306,7 +318,8 @@ mod tests {
     fn test_sglang_native_msgpack_multipart_decoding() {
         // Hex produced by SGLang msgspec msgpack:
         // [123456.78, [["BlockStored", [123, 456], None, [1, 2, 3], 16, None, None]], 0]
-        let payload_hex = "93cb40fe240c7ae147ae9197ab426c6f636b53746f726564927bcd01c8c09301020310c0c000";
+        let payload_hex =
+            "93cb40fe240c7ae147ae9197ab426c6f636b53746f726564927bcd01c8c09301020310c0c000";
         let payload_bytes = hex::decode(payload_hex).unwrap();
         let seq_bytes: [u8; 8] = 42u64.to_be_bytes();
 

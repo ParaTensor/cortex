@@ -1,5 +1,5 @@
-use std::sync::Arc;
 use dashmap::DashMap;
+use std::sync::Arc;
 
 use cortex::config::{EngineType, SchedulerConfig, WorkerConfig, WorkerRole};
 use cortex::hasher::compute_sglang_page_hashes;
@@ -42,7 +42,8 @@ async fn test_end_to_end_zmq_event_to_exact_kv_routing() {
     workers.insert("sgl-gpu-02".to_string(), w2.clone());
 
     let processor = Arc::new(KvEventProcessor::new(tree.clone()));
-    let scheduler = LocalityScheduler::new(SchedulerConfig::default(), tree.clone(), workers.clone());
+    let scheduler =
+        LocalityScheduler::new(SchedulerConfig::default(), tree.clone(), workers.clone());
 
     // 1. Initial State: Workers are in INIT status, no KV in Radix tree
     let tokens: Vec<u32> = (100..164).collect();

@@ -86,7 +86,10 @@ impl SessionLedger {
     pub fn publish(&self, session_id: &str, req: &SessionPublishRequest) -> bool {
         self.evict_stale();
 
-        let mut entry = self.sessions.entry(session_id.to_string()).or_insert_with(|| SessionEntry::new(req.epoch));
+        let mut entry = self
+            .sessions
+            .entry(session_id.to_string())
+            .or_insert_with(|| SessionEntry::new(req.epoch));
         if req.epoch < entry.epoch {
             return false;
         }
@@ -182,7 +185,10 @@ mod tests {
         let ledger = SessionLedger::new();
         assert!(ledger.publish("run-1", &publish_req(2, 20)));
         ledger.record_assignment("run-1", 2, "worker-a");
-        assert_eq!(ledger.sticky_worker("run-1", 2).as_deref(), Some("worker-a"));
+        assert_eq!(
+            ledger.sticky_worker("run-1", 2).as_deref(),
+            Some("worker-a")
+        );
         // Epoch mismatch → no affinity.
         assert_eq!(ledger.sticky_worker("run-1", 3), None);
     }
@@ -208,7 +214,10 @@ mod tests {
         // Old-turn affinity must not leak across epochs.
         assert_eq!(ledger.sticky_worker("run-1", 2), None);
         ledger.record_assignment("run-1", 2, "worker-b");
-        assert_eq!(ledger.sticky_worker("run-1", 2).as_deref(), Some("worker-b"));
+        assert_eq!(
+            ledger.sticky_worker("run-1", 2).as_deref(),
+            Some("worker-b")
+        );
     }
 
     #[test]

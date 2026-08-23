@@ -1,14 +1,14 @@
-use std::sync::Arc;
-use std::time::Instant;
 use axum::{
+    Json,
     body::Body,
     extract::State,
     http::{HeaderMap, HeaderValue, Response, StatusCode},
     response::IntoResponse,
-    Json,
 };
 use futures_util::StreamExt;
 use serde_json::Value;
+use std::sync::Arc;
+use std::time::Instant;
 use tracing::{error, info, warn};
 
 use crate::config::CortexConfig;
@@ -33,7 +33,6 @@ pub struct AppState {
     pub routing_stats: Arc<RoutingStats>,
     pub http_client: reqwest::Client,
 }
-
 
 /// Injects gateway routing telemetry into a JSON object in-place:
 /// top-level `cortex` plus `usage.gateway_*` mirrors (zene issue #128).
@@ -115,43 +114,48 @@ pub async fn chat_completions_handler(
     let page_size = 16;
 
     // 1. Tokenize messages or prompt with Fast Tokenizer & Zero-Allocation LRU Cache
-    let (page_hashes, page_is_anchor): (Arc<Vec<i64>>, Arc<Vec<bool>>) = if let Some(messages_val) = payload.get("messages").and_then(|m| m.as_array()) {
-        let mut chat_messages = Vec::with_capacity(messages_val.len());
-        for msg in messages_val {
-            let role = msg.get("role").and_then(|r| r.as_str()).unwrap_or("user");
-            let content = msg.get("content").and_then(|c| c.as_str()).unwrap_or("");
-            chat_messages.push(ChatMessage {
-                role: role.to_string(),
-                content: content.to_string(),
-            });
-        }
+    let (page_hashes, page_is_anchor): (Arc<Vec<i64>>, Arc<Vec<bool>>) =
+        if let Some(messages_val) = payload.get("messages").and_then(|m| m.as_array()) {
+            let mut chat_messages = Vec::with_capacity(messages_val.len());
+            for msg in messages_val {
+                let role = msg.get("role").and_then(|r| r.as_str()).unwrap_or("user");
+                let content = msg.get("content").and_then(|c| c.as_str()).unwrap_or("");
+                chat_messages.push(ChatMessage {
+                    role: role.to_string(),
+                    content: content.to_string(),
+                });
+            }
 
-        // Tool schema participates in engine-side template rendering; hashes
-        // must be computed over the same stream or exact matching breaks.
-        let tools_val = payload.get("tools").filter(|t| t.is_array());
-        state
-            .tokenizer_registry
-            .tokenize_and_hash_chat_with_tools(model, &chat_messages, tools_val, page_size)
-            .map(|out| (out.page_hashes.clone(), out.page_is_anchor.clone()))
-            .unwrap_or_else(|| (Arc::new(Vec::new()), Arc::new(Vec::new())))
-    } else if let Some(prompt) = payload.get("prompt").and_then(|p| p.as_str()) {
-        state
-            .tokenizer_registry
-            .tokenize_and_hash_text(model, prompt, page_size)
-            .map(|out| (out.page_hashes.clone(), out.page_is_anchor.clone()))
-            .unwrap_or_else(|| (Arc::new(Vec::new()), Arc::new(Vec::new())))
-    } else {
-        (Arc::new(Vec::new()), Arc::new(Vec::new()))
-    };
+            // Tool schema participates in engine-side template rendering; hashes
+            // must be computed over the same stream or exact matching breaks.
+            let tools_val = payload.get("tools").filter(|t| t.is_array());
+            state
+                .tokenizer_registry
+                .tokenize_and_hash_chat_with_tools(model, &chat_messages, tools_val, page_size)
+                .map(|out| (out.page_hashes.clone(), out.page_is_anchor.clone()))
+                .unwrap_or_else(|| (Arc::new(Vec::new()), Arc::new(Vec::new())))
+        } else if let Some(prompt) = payload.get("prompt").and_then(|p| p.as_str()) {
+            state
+                .tokenizer_registry
+                .tokenize_and_hash_text(model, prompt, page_size)
+                .map(|out| (out.page_hashes.clone(), out.page_is_anchor.clone()))
+                .unwrap_or_else(|| (Arc::new(Vec::new()), Arc::new(Vec::new())))
+        } else {
+            (Arc::new(Vec::new()), Arc::new(Vec::new()))
+        };
 
     // 2. Schedule request using 4-tier fallback
-    let mut decision = match state.scheduler.select_worker(model, &page_hashes, &page_is_anchor, None) {
-        Some(d) => d,
-        None => {
-            warn!(model = %model, "No available worker found for request");
-            return Err(StatusCode::SERVICE_UNAVAILABLE);
-        }
-    };
+    let mut decision =
+        match state
+            .scheduler
+            .select_worker(model, &page_hashes, &page_is_anchor, None)
+        {
+            Some(d) => d,
+            None => {
+                warn!(model = %model, "No available worker found for request");
+                return Err(StatusCode::SERVICE_UNAVAILABLE);
+            }
+        };
 
     // 2b. Session affinity override (zene linkage): when the agent-declared
     // epoch matches the published baseline and Tier-1 exact matching found
@@ -174,7 +178,8 @@ pub async fn chat_completions_handler(
             if let Some(sticky_id) = state.sessions.sticky_worker(session_id, epoch) {
                 let sticky_ok = state.workers.get(&sticky_id).is_some_and(|w| {
                     w.config.model == model
-                        && w.get_active_requests() < state.config.scheduler.max_active_requests_per_worker
+                        && w.get_active_requests()
+                            < state.config.scheduler.max_active_requests_per_worker
                 });
                 if sticky_ok {
                     if let Some(w) = state.workers.get(&sticky_id) {
@@ -189,7 +194,9 @@ pub async fn chat_completions_handler(
                 }
             }
         }
-        state.sessions.record_assignment(session_id, epoch, &decision.worker_id);
+        state
+            .sessions
+            .record_assignment(session_id, epoch, &decision.worker_id);
     }
 
     let mode_str = decision.mode.as_str();
@@ -208,7 +215,10 @@ pub async fn chat_completions_handler(
     // Increment active request count
     worker.inc_active_requests();
 
-    let target_url = format!("{}/v1/chat/completions", decision.http_endpoint.trim_end_matches('/'));
+    let target_url = format!(
+        "{}/v1/chat/completions",
+        decision.http_endpoint.trim_end_matches('/')
+    );
 
     let mut req_builder = state.http_client.post(&target_url).json(&payload);
     for (k, v) in headers.iter() {
@@ -253,7 +263,11 @@ pub async fn chat_completions_handler(
     );
     response_headers.insert(
         "x-cortex-anchor-aligned",
-        HeaderValue::from_static(if decision.anchor_aligned { "true" } else { "false" }),
+        HeaderValue::from_static(if decision.anchor_aligned {
+            "true"
+        } else {
+            "false"
+        }),
     );
 
     // Inject routing metadata into the response body for non-streaming JSON
@@ -306,9 +320,9 @@ pub async fn chat_completions_handler(
         // agents on the default streaming path still receive gateway
         // telemetry (zene sets stream_options.include_usage).
         response_headers.remove("content-length");
-        let stream = upstream_res.bytes_stream().map(move |item| {
-            item.map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))
-        });
+        let stream = upstream_res
+            .bytes_stream()
+            .map(move |item| item.map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e)));
         let worker_id = decision.worker_id.clone();
         let mode = mode_str.to_string();
         let hit_tokens = decision.matched_pages * page_size;

@@ -1,9 +1,9 @@
-use std::collections::HashSet;
-use std::sync::Arc;
-use dashmap::DashMap;
-use rand::Rng;
 use crate::config::{SchedulerConfig, WorkerRole};
 use crate::ledger::{RadixHashTree, WorkerRuntimeState, WorkerSyncStatus};
+use dashmap::DashMap;
+use rand::Rng;
+use std::collections::HashSet;
+use std::sync::Arc;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RoutingMode {
@@ -76,7 +76,8 @@ impl LocalityScheduler {
             .iter()
             .filter(|entry| {
                 let w = entry.value();
-                w.config.model == model_id && (w.config.role == role || w.config.role == WorkerRole::Standard)
+                w.config.model == model_id
+                    && (w.config.role == role || w.config.role == WorkerRole::Standard)
             })
             .map(|entry| entry.value().clone())
             .collect();
@@ -204,7 +205,10 @@ impl LocalityScheduler {
         // -------------------------------------------------------------
         // Tier 4: Fallback Round Robin
         // -------------------------------------------------------------
-        let idx = self.rr_counter.fetch_add(1, std::sync::atomic::Ordering::Relaxed) % eligible_workers.len();
+        let idx = self
+            .rr_counter
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+            % eligible_workers.len();
         let fallback_worker = &eligible_workers[idx];
 
         Some(SchedulingDecision {
@@ -259,21 +263,26 @@ mod tests {
         workers.insert("worker-1".to_string(), w1.clone());
         workers.insert("worker-2".to_string(), w2.clone());
 
-        let scheduler = LocalityScheduler::new(SchedulerConfig::default(), tree.clone(), workers.clone());
+        let scheduler =
+            LocalityScheduler::new(SchedulerConfig::default(), tree.clone(), workers.clone());
 
         // Preload KV on w1
         let hashes = vec![111, 222, 333];
         tree.insert_chain("worker-1", &hashes);
 
         // Case 1: Exact KV match
-        let decision = scheduler.select_worker("test-model", &hashes, &[false, false, false, false], None).unwrap();
+        let decision = scheduler
+            .select_worker("test-model", &hashes, &[false, false, false, false], None)
+            .unwrap();
         assert_eq!(decision.worker_id, "worker-1");
         assert_eq!(decision.mode, RoutingMode::ExactKvEvents);
         assert_eq!(decision.matched_pages, 3);
 
         // Case 2: No KV match -> P2C Fallback (with 2 workers and enable_p2c: true)
         let unseeded_hashes = vec![999];
-        let p2c_decision = scheduler.select_worker("test-model", &unseeded_hashes, &[], None).unwrap();
+        let p2c_decision = scheduler
+            .select_worker("test-model", &unseeded_hashes, &[], None)
+            .unwrap();
         assert_eq!(p2c_decision.mode, RoutingMode::FallbackP2c);
         assert_eq!(p2c_decision.matched_pages, 0);
     }
@@ -308,8 +317,8 @@ mod tests {
         workers.insert("worker-deep".to_string(), deep);
         workers.insert("worker-stable".to_string(), stable);
 
-        tree.insert_chain("worker-deep", &[11, 22, 33, 55]);   // 4 pages, ends mid-block
-        tree.insert_chain("worker-stable", &[11, 22, 33]);     // 3 pages, ends on anchor
+        tree.insert_chain("worker-deep", &[11, 22, 33, 55]); // 4 pages, ends mid-block
+        tree.insert_chain("worker-stable", &[11, 22, 33]); // 3 pages, ends on anchor
 
         // Legacy ranking (anchor scoring off): depth wins -> worker-deep.
         let legacy_cfg = SchedulerConfig {
@@ -318,12 +327,18 @@ mod tests {
         };
         let legacy = LocalityScheduler::new(legacy_cfg, tree.clone(), workers.clone());
         let d = legacy
-            .select_worker("test-model", &[11, 22, 33, 55], &[false, false, false, false], None)
+            .select_worker(
+                "test-model",
+                &[11, 22, 33, 55],
+                &[false, false, false, false],
+                None,
+            )
             .unwrap();
         assert_eq!(d.worker_id, "worker-deep");
 
         // Anchor-aware ranking: sigma flips the winner to the anchor-aligned worker.
-        let scheduler = LocalityScheduler::new(SchedulerConfig::default(), tree.clone(), workers.clone());
+        let scheduler =
+            LocalityScheduler::new(SchedulerConfig::default(), tree.clone(), workers.clone());
         let d = scheduler
             .select_worker(
                 "test-model",
